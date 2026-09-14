@@ -1,0 +1,70 @@
+"""Output schema for the enriched, feature-attached transaction stream
+produced by the applyInPandasWithState operator."""
+
+from __future__ import annotations
+
+from pyspark.sql.types import (
+    BooleanType,
+    DoubleType,
+    IntegerType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
+
+PASSTHROUGH_FIELDS = [
+    StructField("customerId", StringType()),
+    StructField("txnId", StringType()),
+    StructField("timestamp", TimestampType()),
+    StructField("amount", DoubleType()),
+    StructField("direction", StringType()),
+    StructField("channel", StringType()),
+    StructField("merchantId", StringType()),
+    StructField("merchantCategory", StringType()),
+    StructField("deviceId", StringType()),
+    StructField("deviceIsNew", BooleanType()),
+    StructField("lat", DoubleType()),
+    StructField("lon", DoubleType()),
+    StructField("city", StringType()),
+    StructField("isFraud", BooleanType()),
+    StructField("fraudPattern", StringType()),
+]
+
+# name -> Spark type, matching the Python types produced by feature_state.apply_event
+FEATURE_FIELD_TYPES: dict[str, type] = {
+    "txnCount1Min": IntegerType,
+    "txnCount5Min": IntegerType,
+    "txnCount15Min": IntegerType,
+    "txnCount1Hour": IntegerType,
+    "txnSum5Min": DoubleType,
+    "txnSum1Hour": DoubleType,
+    "txnSum24Hour": DoubleType,
+    "secondsSincePrevTxn": DoubleType,
+    "maxTxnsInAny60SecWindowToday": IntegerType,
+    "amountZScore": DoubleType,
+    "amountToTrailingMaxRatio": DoubleType,
+    "amountPercentile": DoubleType,
+    "distinctMerchants1Hour": IntegerType,
+    "distinctMerchants24Hour": IntegerType,
+    "distinctDevices24Hour": IntegerType,
+    "distinctDevices7Day": IntegerType,
+    "distinctCities24Hour": IntegerType,
+    "isNewMerchantCategory": BooleanType,
+    "distanceFromPrevKm": DoubleType,
+    "impliedSpeedKmh": DoubleType,
+    "distanceFromModalCityKm": DoubleType,
+    "hourOfDay": IntegerType,
+    "dayOfWeek": IntegerType,
+    "isOutsideActiveHours": BooleanType,
+    "trailingMean": DoubleType,
+    "trailingMax": DoubleType,
+}
+
+FEATURE_FIELDS = [StructField(name, dtype(), nullable=True) for name, dtype in FEATURE_FIELD_TYPES.items()]
+
+OUTPUT_SCHEMA = StructType(PASSTHROUGH_FIELDS + FEATURE_FIELDS)
+
+OUTPUT_COLUMN_NAMES = [f.name for f in OUTPUT_SCHEMA.fields]
+
+STATE_SCHEMA = StructType([StructField("state_json", StringType())])

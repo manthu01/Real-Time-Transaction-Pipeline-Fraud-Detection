@@ -81,7 +81,44 @@ services:
       timeout: 5s
       retries: 5
 
+  spark-feature-job:
+    build:
+      context: .
+      dockerfile: streaming/Dockerfile
+    container_name: pulseguard-spark-feature-job
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka-topics-init:
+        condition: service_completed_successfully
+    volumes:
+      - spark_checkpoints:/opt/pulseguard/checkpoints
+      - spark_ivy_cache:/root/.ivy2
+    command:
+      - /opt/spark/bin/spark-submit
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0
+      - --master
+      - local[2]
+      - pulseguard_streaming/feature_job.py
+      - --bootstrap-servers
+      - kafka:19092
+      - --redis-host
+      - redis
+      - --redis-port
+      - "6379"
+      - --checkpoint-dir
+      - /opt/pulseguard/checkpoints
+      - --starting-offsets
+      - earliest
+      - --trigger-interval
+      - 5 seconds
+
 volumes:
   kafka_data:
   redis_data:
   postgres_data:
+  spark_checkpoints:
+  spark_ivy_cache:
