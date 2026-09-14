@@ -1,0 +1,36 @@
+PulseGuard-Build-Plan.md.pdf
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Node
+node_modules/
+.next/
+dist/
+build/
+*.log
+.env
+.env.local
+
+# Spark / Delta
+spark-warehouse/
+metastore_db/
+checkpoints/
+derby.log
+
+# Data
+data/raw/
+data/checkpoints/
+*.parquet
+!**/sample/*.parquet
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
