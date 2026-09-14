@@ -126,6 +126,32 @@ services:
       - --detection-artifacts-dir
       - /opt/pulseguard/detection-artifacts
 
+  alert-service:
+    build:
+      context: ./serving/alert-service
+    container_name: pulseguard-alert-service
+    ports:
+      - "3001:3001"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      kafka-topics-init:
+        condition: service_completed_successfully
+    environment:
+      PORT: 3001
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: pulseguard
+      POSTGRES_PASSWORD: pulseguard
+      POSTGRES_DB: pulseguard
+      KAFKA_BROKERS: kafka:19092
+      KAFKA_ALERTS_TOPIC: fraud.alerts
+      KAFKA_DISPOSITIONS_TOPIC: analyst.dispositions
+      CORS_ORIGIN: "*"
+      KAFKAJS_NO_PARTITIONER_WARNING: "1"
+
 volumes:
   kafka_data:
   redis_data:

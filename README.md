@@ -32,10 +32,14 @@ implemented and tested; unchecked items are planned.
       supervised LightGBM model, an alert threshold calibrated to analyst
       review capacity, and per-alert explainability — wired live into the
       Spark job and verified producing real alerts to `fraud.alerts`.
-- [ ] **Phase 4 — Serving & analytical layer.** NestJS alert service,
-      Next.js analyst console with live feed / drill-down / disposition
-      capture, and a bronze/silver/gold Delta Lake layer with nightly PSI
-      drift and per-rule precision jobs.
+- **Phase 4 — Serving & analytical layer.**
+  - [x] NestJS alert service: consumes `fraud.alerts`, persists idempotently
+        to Postgres, broadcasts over WebSocket, serves REST history/detail,
+        and captures analyst disposition back to `analyst.dispositions` —
+        verified end-to-end including live WebSocket push.
+  - [ ] Next.js analyst console (live feed, drill-down, disposition UI).
+  - [ ] Bronze/silver/gold Delta Lake layer with nightly PSI drift and
+        per-rule precision jobs.
 - [ ] **Phase 5 — Load testing & failure drills.** Throughput and latency
       numbers under load, plus documented recovery from executor kills,
       Redis outages, and malformed records.
@@ -61,20 +65,22 @@ Kafka topic: raw.transactions
   ▼     ▼               ▼                  ▼
 Redis   Kafka topic    Delta Lake         Kafka topic
 online  fraud.alerts   bronze/silver/gold dead.letter
-feature   │                │
-store     ▼                ▼
+feature   │             (Phase 4)
+store     ▼                │
        NestJS alert    Nightly batch jobs
-       service    <-   (fraud rate, per-rule
-         │  Phase 4     precision, PSI drift)  <- Phase 4
+       service         (fraud rate, per-rule
+         │              precision, PSI drift)  <- Phase 4
      WebSocket
          │
    Next.js analyst console      <- Phase 4
    (live feed, drill-down, disposition)
          │
-   Label store → retraining     <- Phase 4
+   analyst.dispositions (Kafka) → retraining     <- retraining is Phase 4/5
 ```
 
-*Phase 4–5 components above are planned; see Status.*
+*Delta Lake, the Next.js console, and PSI drift are planned; see Status.
+Everything else above — including the NestJS alert service and the
+disposition→Kafka feedback loop — is built and verified.*
 
 ## Why each piece matters
 
@@ -134,9 +140,20 @@ detection/          Hybrid rules + anomaly-model detection layer
                       except metrics.json/threshold_tradeoff.*/threshold.json/
                       feature_names.json -- see Getting started)
   tests/             34 tests, no Spark/Kafka/trained-model required
+serving/
+  alert-service/     NestJS: consumes fraud.alerts, serves the REST/WebSocket
+                      API the (future) analyst console will use
+    src/alerts/        entity, service, controller, WebSocket gateway
+    src/kafka/         consumer (fraud.alerts -> Postgres) and producer
+                        (disposition -> analyst.dispositions), split into
+                        separate modules to avoid a circular dependency
+    src/metrics/       alerts/day, per-rule precision, mean time to
+                        disposition, false-positive-rate trend
+    *.spec.ts          22 tests (mocked repository, no live Postgres/Kafka)
 infra/
   kafka/create_topics.sh   topic provisioning (partitions/retention)
-docker-compose.yml   Kafka (KRaft), Kafka UI, Redis, Postgres, Spark job
+docker-compose.yml   Kafka (KRaft), Kafka UI, Redis, Postgres, Spark job,
+                     alert service
 ```
 
 ## Getting started
@@ -248,7 +265,28 @@ install pyspark` locally to run them outside the container):
 cd generator && python -m pytest tests/ -v
 cd streaming && python -m pytest tests/ -v
 cd detection && python -m pytest tests/ -v
+cd serving/alert-service && npm test
 ```
+
+**8. The alert service starts automatically** with `docker compose up -d`
+too, at `http://localhost:3001`. It consumes `fraud.alerts` from the
+beginning of the topic on first run (so it backfills whatever the Spark
+job has already produced), persists every alert to Postgres keyed by
+`alertId` (idempotent — re-consuming the same message twice updates
+nothing), and broadcasts `alert.created` / `alert.updated` over WebSocket.
+
+```bash
+curl http://localhost:3001/alerts?limit=5
+curl http://localhost:3001/alerts/<alertId>          # detail + the customer's other recent alerts
+curl -X POST http://localhost:3001/alerts/<alertId>/disposition \
+  -H "Content-Type: application/json" \
+  -d '{"status":"CONFIRMED_FRAUD","note":"verified with customer callback"}'
+curl http://localhost:3001/metrics/summary           # alerts/day, precision by rule, mean time to disposition, FP-rate trend
+```
+
+A disposition both updates Postgres and publishes to `analyst.dispositions`
+(compacted, keyed by `alertId`) — the label-store feedback loop a real
+retraining pipeline would consume from.
 
 ## The generator, in more detail
 
@@ -419,6 +457,56 @@ train/serve distribution mismatch worth knowing about, not a defect in the
 scoring code — and exactly the kind of thing PSI drift monitoring (Phase 4)
 is meant to surface automatically instead of requiring someone to notice it
 in the logs.
+
+## The alert service, in more detail
+
+**Idempotent ingestion, on purpose.** The alert entity's primary key is
+`alertId` (the UUID the Spark job generates), not an auto-incrementing
+one. Re-consuming the same Kafka message twice — a consumer restart before
+offsets commit, a rebalance, a replay — upserts into the same row instead
+of creating a duplicate. This is the same exactly-once-in-effect concern
+as the streaming job's idempotent Delta writes, just at the serving layer:
+a duplicate alert isn't just untidy, it would double-count in `alertsPerDay`
+and skew per-rule precision.
+
+**Two Kafka modules, not one, to avoid a cycle.** `AlertsController` needs
+the producer (to publish a disposition); `KafkaConsumerService` needs
+`AlertsService` and `AlertsGateway` (to persist and broadcast an incoming
+alert). Putting both in one `KafkaModule` that `AlertsModule` imports
+creates `AlertsModule → KafkaModule → AlertsModule`. Splitting into
+`KafkaProducerModule` (no dependency on `AlertsModule`) and
+`KafkaConsumerModule` (imports `AlertsModule`, not the other way around)
+breaks the cycle without reaching for `forwardRef()`.
+
+**Two real bugs found during live verification, both now regression-tested:**
+
+1. **`jsonb_array_elements_text()` inside TypeORM's `QueryBuilder.innerJoin()`
+   generated invalid SQL** (`zero-length delimited identifier`) — the query
+   builder's join API expects a relation path or a subquery, not an
+   arbitrary set-returning expression. Per-rule precision (unnesting each
+   alert's `triggeredRules` array to group by individual rule) is exactly
+   the kind of Postgres-specific query that's clearer as raw SQL than
+   forced through an ORM abstraction built for a different shape of query
+   — fixed by dropping to `repo.query()` with the classic
+   `FROM alerts, jsonb_array_elements_text(...)` lateral-unnest pattern.
+2. **Mean time to disposition was measured from the wrong timestamp.**
+   It used the alert's `timestamp` field (the underlying transaction's
+   *event time*) instead of `ingestedAt` (when the alert actually appeared
+   in this service). For live traffic those are seconds apart and the bug
+   was invisible; testing against the Spark job's backlog — where event
+   time can be hours or days before ingestion — produced a **negative**
+   mean time to disposition, which is what surfaced it. "Time to
+   disposition" is an analyst-workflow metric (how long did this sit in
+   the queue before someone looked at it); it has to be measured from
+   ingestion, not from whenever the underlying transaction happened.
+
+**What "drill-down" can and can't show yet.** The build plan's console
+mock-up includes "the customer's last 20 transactions for context" and a
+map of recent geo activity. This service can offer a customer's other
+*alerts* (`GET /alerts/:alertId` returns `recentForCustomer`), but not
+their full transaction history — that requires a queryable transaction
+store, which is the Delta Lake bronze layer's job (still Phase 4/planned),
+not something to fake with an ad-hoc Kafka read here.
 
 ## Common mistakes
 
