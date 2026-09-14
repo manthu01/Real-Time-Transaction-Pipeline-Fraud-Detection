@@ -1,0 +1,6 @@
+{
+  "target_alerts_per_day": 200.0,
+  "target_alert_rate": 0.021667297701218575,
+  "threshold": 0.5412477031788604,
+  "actual_alert_rate": 0.02167891876132364
+}

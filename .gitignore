@@ -30,6 +30,14 @@ data/checkpoints/
 *.parquet
 !**/sample/*.parquet
 
+# Generated training data and trained model binaries -- regenerate with
+# `python -m pulseguard_generator simulate ...` + `python -m pulseguard_detection.train ...`
+# (see detection/README section). Evaluation evidence (metrics.json,
+# threshold_tradeoff.csv/png, threshold.json, feature_names.json) is kept.
+detection/data/
+detection/artifacts/*.joblib
+detection/artifacts/lightgbm.txt
+
 # OS / editor
 .DS_Store
 .idea/

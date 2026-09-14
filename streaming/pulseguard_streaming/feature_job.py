@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+from pathlib import Path
 from typing import Iterator
 
 import pandas as pd
@@ -23,8 +24,9 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.streaming.state import GroupState, GroupStateTimeout
 
+from pulseguard_streaming.alert_scoring import make_alert_scoring_func
 from pulseguard_streaming.feature_state import FEATURE_NAMES, apply_event, new_state
-from pulseguard_streaming.output_schema import OUTPUT_COLUMN_NAMES, OUTPUT_SCHEMA, STATE_SCHEMA
+from pulseguard_streaming.output_schema import ALERT_SCHEMA, OUTPUT_COLUMN_NAMES, OUTPUT_SCHEMA, STATE_SCHEMA
 from pulseguard_streaming.redis_writer import write_partition
 from pulseguard_streaming.schema import REQUIRED_NON_NULL_FIELDS, TRANSACTION_SCHEMA
 from pulseguard_streaming.state_codec import deserialize_state, serialize_state
@@ -46,6 +48,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--trigger-interval", default="5 seconds")
     p.add_argument("--enable-window-demo", action="store_true", default=True)
     p.add_argument("--no-window-demo", dest="enable_window_demo", action="store_false")
+    p.add_argument("--alerts-topic", default="fraud.alerts")
+    p.add_argument("--detection-artifacts-dir", default="/opt/pulseguard/detection-artifacts")
+    p.add_argument("--enable-detection", action="store_true", default=True)
+    p.add_argument("--no-detection", dest="enable_detection", action="store_false", help="skip rule+model scoring, e.g. if artifacts haven't been trained yet")
     return p.parse_args(argv)
 
 
@@ -220,6 +226,30 @@ def write_features_to_redis(
     )
 
 
+def score_alerts_stream(feature_stream: DataFrame, artifacts_dir: str) -> DataFrame:
+    """Runs the trained rules+model scoring function (pulseguard_detection)
+    over every enriched transaction, keeping only the ones that actually
+    trigger an alert. A stateless per-partition transform -- no
+    applyInPandasWithState needed here, since scoring a single transaction
+    depends only on its own already-computed feature vector, not on
+    anything that needs to persist across events."""
+    score_func = make_alert_scoring_func(artifacts_dir, FEATURE_NAMES)
+    return feature_stream.mapInPandas(score_func, schema=ALERT_SCHEMA)
+
+
+def write_alerts_to_kafka(alerts_stream: DataFrame, bootstrap_servers: str, topic: str, checkpoint_dir: str, trigger_interval: str):
+    return (
+        alerts_stream.select(F.to_json(F.struct([F.col(c) for c in alerts_stream.columns])).alias("value"))
+        .writeStream.format("kafka")
+        .option("kafka.bootstrap.servers", bootstrap_servers)
+        .option("topic", topic)
+        .option("checkpointLocation", f"{checkpoint_dir}/alerts")
+        .trigger(processingTime=trigger_interval)
+        .outputMode("append")
+        .start()
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     spark = build_spark()
@@ -234,10 +264,27 @@ def main(argv: list[str] | None = None) -> None:
     if args.enable_window_demo:
         start_window_demo_query(valid_with_watermark, args.trigger_interval)
 
+    # feature_stream is consumed by two independent writeStream queries
+    # below (Redis + alerts). Spark re-executes applyInPandasWithState
+    # separately for each -- this recomputes the same feature values twice
+    # rather than sharing one state store, which is the accepted tradeoff
+    # here for keeping two independently-restartable sinks instead of
+    # adding an intermediate Kafka topic just to fan the stream out once.
     feature_stream = compute_feature_stream(valid_with_watermark)
     write_features_to_redis(
         feature_stream, args.redis_host, args.redis_port, args.redis_ttl_seconds, args.checkpoint_dir, args.trigger_interval
     )
+
+    if args.enable_detection:
+        if (Path(args.detection_artifacts_dir) / "threshold.json").exists():
+            alerts_stream = score_alerts_stream(feature_stream, args.detection_artifacts_dir)
+            write_alerts_to_kafka(alerts_stream, args.bootstrap_servers, args.alerts_topic, args.checkpoint_dir, args.trigger_interval)
+        else:
+            print(
+                f"WARNING: no trained detection artifacts found at {args.detection_artifacts_dir} "
+                "-- skipping rule/model scoring. Run `python -m pulseguard_detection.train` first "
+                "(see detection/README) and restart this job to enable alerts."
+            )
 
     # blocks until any one of the queries above stops (normally only on
     # failure or a driver shutdown) so a crash in one query surfaces instead

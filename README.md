@@ -27,10 +27,11 @@ implemented and tested; unchecked items are planned.
       via a stateful per-key operator, a watermarked sliding-window
       aggregation demo, dead-letter routing for malformed records, and a
       Redis online feature store — verified end-to-end against live Kafka.
-- [ ] **Phase 3 — Detection layer.** Versioned velocity-rule engine plus an
-      Isolation Forest anomaly model benchmarked against a supervised
-      LightGBM model, with an alert threshold calibrated to analyst review
-      capacity.
+- [x] **Phase 3 — Detection layer.** A safe (no-`eval`) versioned rule
+      engine, an Isolation Forest anomaly model benchmarked against a
+      supervised LightGBM model, an alert threshold calibrated to analyst
+      review capacity, and per-alert explainability — wired live into the
+      Spark job and verified producing real alerts to `fraud.alerts`.
 - [ ] **Phase 4 — Serving & analytical layer.** NestJS alert service,
       Next.js analyst console with live feed / drill-down / disposition
       capture, and a bronze/silver/gold Delta Lake layer with nightly PSI
@@ -52,8 +53,8 @@ Kafka topic: raw.transactions
    │  Spark Structured Streaming │
    │  ├─ parse + validate        │
    │  ├─ 26 rolling features     │
-   │  ├─ velocity rule engine    │   <- Phase 3
-   │  └─ Isolation Forest score  │   <- Phase 3
+   │  ├─ velocity rule engine    │
+   │  └─ Isolation Forest score  │
    └────┬─────────────────────────┘
         │
   ┌─────┼───────────────┬──────────────────┐
@@ -63,17 +64,17 @@ online  fraud.alerts   bronze/silver/gold dead.letter
 feature   │                │
 store     ▼                ▼
        NestJS alert    Nightly batch jobs
-       service         (fraud rate, per-rule
-         │              precision, PSI drift)
+       service    <-   (fraud rate, per-rule
+         │  Phase 4     precision, PSI drift)  <- Phase 4
      WebSocket
          │
-   Next.js analyst console
+   Next.js analyst console      <- Phase 4
    (live feed, drill-down, disposition)
          │
-   Label store → retraining
+   Label store → retraining     <- Phase 4
 ```
 
-*Phase 3–5 components above are planned; see Status.*
+*Phase 4–5 components above are planned; see Status.*
 
 ## Why each piece matters
 
@@ -117,6 +118,22 @@ streaming/          Spark Structured Streaming feature computation job
     redis_writer.py    writes feature vectors to the online feature store
   tests/             17 tests, all Spark-free (pure Python + pandas)
   Dockerfile         apache/spark-py:v3.4.0 + this job's dependencies
+detection/          Hybrid rules + anomaly-model detection layer
+  pulseguard_detection/
+    rule_engine.py   safe (no `eval`) AST-based expression evaluator
+    rules.json       6 versioned velocity rules
+    dataset.py       batch feature backfill -- replays history through
+                      the *same* feature_state.apply_event the streaming
+                      job uses, so there is one implementation of "what a
+                      feature means," not two
+    threshold.py     alert threshold selection from analyst capacity
+    train.py         trains + evaluates Isolation Forest and LightGBM,
+                      writes artifacts/ (models, threshold, metrics, chart)
+    score.py         the live scoring function: rules + model + explainability
+  artifacts/         trained models + evaluation evidence (gitignored
+                      except metrics.json/threshold_tradeoff.*/threshold.json/
+                      feature_names.json -- see Getting started)
+  tests/             34 tests, no Spark/Kafka/trained-model required
 infra/
   kafka/create_topics.sh   topic provisioning (partitions/retention)
 docker-compose.yml   Kafka (KRaft), Kafka UI, Redis, Postgres, Spark job
@@ -199,14 +216,38 @@ docker compose logs -f spark-feature-job   # batch progress, window-agg demo out
 docker exec pulseguard-redis redis-cli HGETALL feat:C000001
 ```
 
-**6. Run the tests** (all pure Python/pandas — no live Spark session,
-Kafka, or Docker required to run them; `streaming/`'s tests only import
-`pyspark.sql.types` for schema definitions, so `pip install pyspark` locally
-to run them outside the container):
+**6. Train the detection layer** (host-side, not in Docker — it needs
+lightgbm/matplotlib the Spark image doesn't carry, and this is meant to be
+a deliberate, evaluated step, not something that silently reruns on every
+container start):
+
+```bash
+cd generator
+python -m pulseguard_generator simulate --customers 2000 --days 21 --seed 7 --sink jsonl --out ../detection/data/training_raw.jsonl
+
+cd ../detection
+pip install -r requirements.txt
+python -m pulseguard_detection.train --input-jsonl data/training_raw.jsonl
+```
+
+This writes `detection/artifacts/`: the trained Isolation Forest and
+LightGBM models, the calibrated threshold, the alerts/day-vs-fraud-caught
+trade-off chart, and `metrics.json` with every number in the section below.
+`docker-compose.yml` bind-mounts `detection/artifacts/` into the Spark
+container read-only — restart it (`docker compose restart
+spark-feature-job`) after training to pick up a newly-trained model. If
+the artifacts don't exist yet, the job logs a warning and runs with
+detection disabled rather than crashing.
+
+**7. Run the tests** (all pure Python/pandas — no live Spark session,
+Kafka, Docker, or a trained model required to run them; `streaming/`'s
+tests only import `pyspark.sql.types` for schema definitions, so `pip
+install pyspark` locally to run them outside the container):
 
 ```bash
 cd generator && python -m pytest tests/ -v
 cd streaming && python -m pytest tests/ -v
+cd detection && python -m pytest tests/ -v
 ```
 
 ## The generator, in more detail
@@ -283,6 +324,101 @@ feature-backfill script (for building a training set from historical data)
 will call the *same function*, in order, over each customer's historical
 records. It's not "the same logic reimplemented for training" — it's the
 same function, imported twice.
+
+## The detection layer, in more detail
+
+**Rules are data, evaluated by a restricted interpreter — never `eval()`.**
+`rule_engine.py` parses each rule expression with Python's `ast` module and
+walks the tree through a whitelist of node types (boolean/comparison/
+arithmetic operators, variable lookups). There is no attribute access, no
+subscripting, no function calls — so a malicious or malformed rule string
+has no code-execution surface at all, regardless of what it contains. The 6
+rules in `rules.json` are adapted from the build plan's examples to the
+feature names this pipeline actually computes (e.g. `CARD_TESTING` checks
+`maxTxnsInAny60SecWindowToday` rather than a `txnCount1Min`/`distinctMerchants1Min`
+combination, since a single bounded event-history buffer already gives an
+exact burst count).
+
+**Real numbers, measured on a 2000-customer/21-day synthetic dataset**
+(192,073 transactions, 447 labelled fraud, time-based 75/25 train/holdout
+split so nothing evaluates on data from before it was "trained"):
+
+| Metric | Value |
+|---|---|
+| Isolation Forest PR-AUC (unsupervised, holdout) | 0.378 |
+| LightGBM PR-AUC (supervised benchmark, holdout) | 0.936 |
+| Rules-only: precision / recall / alert rate | 0.092 / 0.747 / 1.40% |
+| Alert threshold, calibrated to 5 analysts × 40 reviews/day | 200 alerts/day → 2.17% alert rate |
+| Model-only at that threshold: precision / recall | 0.064 / 0.807 |
+| Hybrid (rules OR model≥threshold): precision / recall / alert rate | 0.048 / 0.819 / 2.98% |
+| False-positive rate at matched recall (0.819): model-only vs hybrid | 3.68% vs 2.84% |
+
+![Alerts/day vs fraud caught](detection/artifacts/threshold_tradeoff.png)
+
+A few things worth saying honestly about these numbers rather than letting
+them stand alone:
+
+- **LightGBM's PR-AUC (0.936) is high because the injected fraud patterns
+  are, by construction, extreme outliers** — an account takeover is 8-15x
+  a customer's trailing mean at 2-4AM; that's an easy signal for a
+  supervised model once it has labels. `best_iteration_: 1` (found via
+  early stopping against a validation split carved from the *training*
+  set, never the holdout) means a single boosting round already separates
+  the classes about as well as 1000 would — more rounds overfit the ~300
+  training examples of the minority class. This is a real, measured
+  finding, not a hyperparameter picked because it flattered the holdout
+  score.
+- **The Isolation Forest's lower PR-AUC (0.378) is the expected cost of
+  going unsupervised** — it has no labels to learn from and has to decide
+  what's anomalous purely from the shape of normal behaviour. That gap
+  *is* the answer to "what do you give up going unsupervised," and it's
+  why the rules exist alongside it: rules give zero-latency, fully
+  explainable coverage of the known patterns the unsupervised model is
+  weakest on.
+- **The hybrid system's false-positive rate (2.84%) beats pushing the
+  model-only threshold down to the same recall (3.68%)** — this is the
+  correct comparison (same recall, different false-positive cost), not
+  "hybrid precision vs. model-only precision at the same threshold" (which
+  looks worse for the hybrid simply because it alerts on more volume).
+- **These are demo-scale numbers, not bank-scale ones.** The holdout spans
+  5.2 days at ~9,231 txns/day; the build plan's own worked example assumes
+  4M txns/day. The *mechanism* — calibrate to review capacity, don't pick
+  F1-optimal — is what transfers, not the literal alert-rate percentage.
+
+**Explainability, mechanically.** `score.py`'s `top_contributing_features`
+ranks each feature by how many standard deviations it sits from the
+non-fraud training population's mean (`feature_stats.json`) — a
+deliberately simple signal, not a SHAP value, chosen so the live scoring
+path (`alert_scoring.py`, wired into `feature_job.py` via `mapInPandas`)
+has no extra heavy dependency. Every alert written to `fraud.alerts`
+carries `triggeredRules`, a `severity` (the highest severity among fired
+rules, or scaled from how far the anomaly score cleared the threshold if
+no rule fired), and the top 3 unusual features — the build plan's point
+that "an alert without an explanation is an alert an analyst can't act on."
+
+**A real bug this caught: NaN vs. None.** The first live run of the wired-in
+scoring stage crashed every micro-batch with `ValueError: Input X contains
+NaN`. Spark represents a nullable `DoubleType` column (like
+`secondsSincePrevTxn` on a customer's very first transaction) as `NaN` once
+it crosses into pandas/Arrow, not Python `None` — so a `value is not None`
+guard silently failed to catch it, and the raw NaN reached
+`IsolationForest.score_samples`. Fixed with an explicit `_is_missing()`
+check (`math.isnan`, guarded for non-numeric types) and covered by a
+regression test (`test_scoring_survives_nan_features_without_crashing`) so
+it can't come back silently.
+
+**A real observation, not a bug: load-test traffic looks anomalous.**
+Once wired in, the live pipeline flagged a very high fraction of the
+raw.transactions backlog — because a large part of that backlog is the
+Phase 1/5 load-test firehose (hundreds of transactions/second across a
+small customer pool), and the model was trained only on realistically-paced
+`simulate`-mode data. A customer doing 0.6 transactions/second looks
+nothing like the salaried-urban/student/etc. archetypes it learned "normal"
+from, so the anomaly score (correctly) says so. That's a genuine
+train/serve distribution mismatch worth knowing about, not a defect in the
+scoring code — and exactly the kind of thing PSI drift monitoring (Phase 4)
+is meant to surface automatically instead of requiring someone to notice it
+in the logs.
 
 ## Common mistakes
 

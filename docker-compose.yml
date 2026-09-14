@@ -96,6 +96,12 @@ services:
     volumes:
       - spark_checkpoints:/opt/pulseguard/checkpoints
       - spark_ivy_cache:/root/.ivy2
+      # trained model artifacts are a host-side, gitignored build output
+      # (see detection/README) -- bind-mounted read-only rather than baked
+      # into the image, so retraining a new "champion" doesn't require a
+      # rebuild, matching the build plan's "evaluate, don't auto-promote"
+      # stance on retraining.
+      - ./detection/artifacts:/opt/pulseguard/detection-artifacts:ro
     command:
       - /opt/spark/bin/spark-submit
       - --packages
@@ -115,6 +121,10 @@ services:
       - earliest
       - --trigger-interval
       - 5 seconds
+      - --alerts-topic
+      - fraud.alerts
+      - --detection-artifacts-dir
+      - /opt/pulseguard/detection-artifacts
 
 volumes:
   kafka_data:

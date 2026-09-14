@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulseguard-detection"
+version = "0.1.0"
+description = "PulseGuard hybrid rules + anomaly-model detection layer"
+requires-python = ">=3.9"
+
+[tool.setuptools.packages.find]
+include = ["pulseguard_detection*"]
+
+[tool.setuptools.package-data]
+pulseguard_detection = ["rules.json"]

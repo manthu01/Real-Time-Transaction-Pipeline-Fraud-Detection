@@ -1,0 +1,43 @@
+{
+  "dataset": {
+    "total_transactions": 192073,
+    "fraud_count": 447,
+    "fraud_rate": 0.0023272401638960187,
+    "train_size": 144054,
+    "holdout_size": 48019,
+    "holdout_span_days": 5.202209841574074,
+    "holdout_txns_per_day": 9230.500395476263
+  },
+  "isolation_forest": {
+    "pr_auc": 0.3777857346568373
+  },
+  "lightgbm": {
+    "pr_auc": 0.9361791554802478,
+    "best_iteration": 1
+  },
+  "rules_only": {
+    "alert_rate": 0.014036110706178804,
+    "precision": 0.09198813056379822,
+    "recall": 0.7469879518072289
+  },
+  "threshold_selection": {
+    "target_alerts_per_day": 200.0,
+    "target_alert_rate": 0.021667297701218575,
+    "threshold": 0.5412477031788604,
+    "actual_alert_rate": 0.02167891876132364
+  },
+  "model_only_at_threshold": {
+    "precision": 0.0643611911623439,
+    "recall": 0.8072289156626506
+  },
+  "hybrid_at_threshold": {
+    "precision": 0.04758572428271519,
+    "recall": 0.8192771084337349,
+    "alert_rate": 0.029759053707907285
+  },
+  "false_positive_rate_at_matched_recall": {
+    "matched_recall": 0.8192771084337349,
+    "model_only_fpr": 0.036799065420560745,
+    "hybrid_fpr": 0.02839202269692924
+  }
+}

@@ -1,0 +1,38 @@
+[
+  {
+    "id": "CARD_TESTING",
+    "expr": "maxTxnsInAny60SecWindowToday >= 5 and amount < 100",
+    "severity": "HIGH",
+    "version": 1
+  },
+  {
+    "id": "AMOUNT_SPIKE",
+    "expr": "amount > 10 * trailingMean and amount > 25000",
+    "severity": "MEDIUM",
+    "version": 1
+  },
+  {
+    "id": "ATO_SIGNATURE",
+    "expr": "deviceIsNew and distanceFromModalCityKm > 300 and amountZScore > 3",
+    "severity": "CRITICAL",
+    "version": 1
+  },
+  {
+    "id": "IMPOSSIBLE_TRAVEL",
+    "expr": "impliedSpeedKmh > 900 and distanceFromPrevKm > 200",
+    "severity": "HIGH",
+    "version": 1
+  },
+  {
+    "id": "MULE_PATTERN",
+    "expr": "txnCount1Hour >= 5 and txnSum1Hour > 150000",
+    "severity": "CRITICAL",
+    "version": 1
+  },
+  {
+    "id": "THRESHOLD_STRUCTURING",
+    "expr": "amount >= 44000 and amount <= 49999 and txnCount1Hour >= 2",
+    "severity": "HIGH",
+    "version": 1
+  }
+]

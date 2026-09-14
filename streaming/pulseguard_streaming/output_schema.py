@@ -4,6 +4,7 @@ produced by the applyInPandasWithState operator."""
 from __future__ import annotations
 
 from pyspark.sql.types import (
+    ArrayType,
     BooleanType,
     DoubleType,
     IntegerType,
@@ -68,3 +69,28 @@ OUTPUT_SCHEMA = StructType(PASSTHROUGH_FIELDS + FEATURE_FIELDS)
 OUTPUT_COLUMN_NAMES = [f.name for f in OUTPUT_SCHEMA.fields]
 
 STATE_SCHEMA = StructType([StructField("state_json", StringType())])
+
+TOP_FEATURE_STRUCT = StructType(
+    [
+        StructField("name", StringType()),
+        StructField("value", DoubleType()),
+        StructField("zScore", DoubleType()),
+    ]
+)
+
+ALERT_SCHEMA = StructType(
+    [
+        StructField("alertId", StringType()),
+        StructField("txnId", StringType()),
+        StructField("customerId", StringType()),
+        StructField("timestamp", TimestampType()),
+        StructField("score", DoubleType()),
+        StructField("severity", StringType()),
+        StructField("triggeredRules", ArrayType(StringType())),
+        StructField("topFeatures", ArrayType(TOP_FEATURE_STRUCT)),
+        StructField("trailingMean", DoubleType()),
+        StructField("trailingMax", DoubleType()),
+    ]
+)
+
+ALERT_COLUMN_NAMES = [f.name for f in ALERT_SCHEMA.fields]
