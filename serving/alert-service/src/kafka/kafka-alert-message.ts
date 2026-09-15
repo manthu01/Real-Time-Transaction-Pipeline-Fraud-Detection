@@ -15,6 +15,13 @@ export interface KafkaAlertMessage {
   topFeatures: TopFeature[];
   trailingMean: number | null;
   trailingMax: number | null;
+  amount: number | null;
+  channel: string | null;
+  merchantId: string | null;
+  merchantCategory: string | null;
+  city: string | null;
+  lat: number | null;
+  lon: number | null;
 }
 
 export function isValidKafkaAlertMessage(value: unknown): value is KafkaAlertMessage {

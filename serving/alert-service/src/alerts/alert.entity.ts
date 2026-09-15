@@ -57,6 +57,32 @@ export class Alert {
   @Column({ type: 'double precision', nullable: true })
   trailingMax: number | null;
 
+  @Column({ type: 'double precision', nullable: true })
+  amount: number | null;
+
+  // TypeORM infers a column's SQL type from TypeScript's emitted reflection
+  // metadata, which collapses any `string | null` union down to `Object`
+  // (not `String`) -- an explicit `type: 'varchar'` is required for every
+  // nullable string column here, not just the pattern-setting one
+  // (dispositionNote, above) that happened to already have one.
+  @Column({ type: 'varchar', nullable: true })
+  channel: string | null;
+
+  @Column({ type: 'varchar', nullable: true })
+  merchantId: string | null;
+
+  @Column({ type: 'varchar', nullable: true })
+  merchantCategory: string | null;
+
+  @Column({ type: 'varchar', nullable: true })
+  city: string | null;
+
+  @Column({ type: 'double precision', nullable: true })
+  lat: number | null;
+
+  @Column({ type: 'double precision', nullable: true })
+  lon: number | null;
+
   @Index()
   @Column({ type: 'enum', enum: DispositionStatus, default: DispositionStatus.PENDING })
   dispositionStatus: DispositionStatus;

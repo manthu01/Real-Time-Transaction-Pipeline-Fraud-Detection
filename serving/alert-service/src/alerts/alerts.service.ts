@@ -46,6 +46,13 @@ export class AlertsService {
       topFeatures: message.topFeatures,
       trailingMean: message.trailingMean,
       trailingMax: message.trailingMax,
+      amount: message.amount,
+      channel: message.channel,
+      merchantId: message.merchantId,
+      merchantCategory: message.merchantCategory,
+      city: message.city,
+      lat: message.lat,
+      lon: message.lon,
       dispositionStatus: DispositionStatus.PENDING,
     });
     return this.repo.save(alert);

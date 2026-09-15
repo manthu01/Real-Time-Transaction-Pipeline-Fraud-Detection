@@ -90,6 +90,13 @@ ALERT_SCHEMA = StructType(
         StructField("topFeatures", ArrayType(TOP_FEATURE_STRUCT)),
         StructField("trailingMean", DoubleType()),
         StructField("trailingMax", DoubleType()),
+        StructField("amount", DoubleType()),
+        StructField("channel", StringType()),
+        StructField("merchantId", StringType()),
+        StructField("merchantCategory", StringType()),
+        StructField("city", StringType()),
+        StructField("lat", DoubleType()),
+        StructField("lon", DoubleType()),
     ]
 )
 

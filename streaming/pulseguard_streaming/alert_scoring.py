@@ -59,6 +59,13 @@ def make_alert_scoring_func(artifacts_dir: str, feature_names: tuple[str, ...]):
                         "topFeatures": alert["topFeatures"],
                         "trailingMean": features.get("trailingMean"),
                         "trailingMax": features.get("trailingMax"),
+                        "amount": row.amount,
+                        "channel": row.channel,
+                        "merchantId": row.merchantId,
+                        "merchantCategory": row.merchantCategory,
+                        "city": row.city,
+                        "lat": row.lat,
+                        "lon": row.lon,
                     }
                 )
             yield pd.DataFrame(rows, columns=ALERT_COLUMN_NAMES) if rows else pd.DataFrame(columns=ALERT_COLUMN_NAMES)

@@ -37,7 +37,12 @@ implemented and tested; unchecked items are planned.
         to Postgres, broadcasts over WebSocket, serves REST history/detail,
         and captures analyst disposition back to `analyst.dispositions` —
         verified end-to-end including live WebSocket push.
-  - [ ] Next.js analyst console (live feed, drill-down, disposition UI).
+  - [x] Next.js analyst console: live feed (WebSocket-pushed, severity
+        colour-coded), drill-down (transaction, triggered rules, top
+        feature contributions, an OpenStreetMap embed, the customer's
+        other recent alerts), and disposition capture — verified in an
+        actual browser against the live stack, including a real
+        disposition round-trip and the metrics dashboard updating from it.
   - [ ] Bronze/silver/gold Delta Lake layer with nightly PSI drift and
         per-rule precision jobs.
 - [ ] **Phase 5 — Load testing & failure drills.** Throughput and latency
@@ -72,14 +77,14 @@ store     ▼                │
          │              precision, PSI drift)  <- Phase 4
      WebSocket
          │
-   Next.js analyst console      <- Phase 4
+   Next.js analyst console
    (live feed, drill-down, disposition)
          │
-   analyst.dispositions (Kafka) → retraining     <- retraining is Phase 4/5
+   analyst.dispositions (Kafka) → retraining     <- retraining is Phase 5
 ```
 
-*Delta Lake, the Next.js console, and PSI drift are planned; see Status.
-Everything else above — including the NestJS alert service and the
+*Delta Lake and PSI drift are planned; see Status. Everything else above —
+including the NestJS alert service, the Next.js console, and the
 disposition→Kafka feedback loop — is built and verified.*
 
 ## Why each piece matters
@@ -142,7 +147,7 @@ detection/          Hybrid rules + anomaly-model detection layer
   tests/             34 tests, no Spark/Kafka/trained-model required
 serving/
   alert-service/     NestJS: consumes fraud.alerts, serves the REST/WebSocket
-                      API the (future) analyst console will use
+                      API the analyst console uses
     src/alerts/        entity, service, controller, WebSocket gateway
     src/kafka/         consumer (fraud.alerts -> Postgres) and producer
                         (disposition -> analyst.dispositions), split into
@@ -150,10 +155,15 @@ serving/
     src/metrics/       alerts/day, per-rule precision, mean time to
                         disposition, false-positive-rate trend
     *.spec.ts          22 tests (mocked repository, no live Postgres/Kafka)
+  analyst-console/   Next.js: live feed, drill-down, disposition capture
+    src/app/           live feed (/), drill-down (/alerts/[alertId]), metrics
+    src/components/    severity/disposition badges, hand-rolled feature bars,
+                        an OpenStreetMap iframe embed, the disposition form
+    src/lib/           REST client, a shared socket.io singleton, shared types
 infra/
   kafka/create_topics.sh   topic provisioning (partitions/retention)
 docker-compose.yml   Kafka (KRaft), Kafka UI, Redis, Postgres, Spark job,
-                     alert service
+                     alert service, analyst console
 ```
 
 ## Getting started
@@ -287,6 +297,27 @@ curl http://localhost:3001/metrics/summary           # alerts/day, precision by 
 A disposition both updates Postgres and publishes to `analyst.dispositions`
 (compacted, keyed by `alertId`) — the label-store feedback loop a real
 retraining pipeline would consume from.
+
+**9. The analyst console starts automatically too**, at
+`http://localhost:3000`:
+
+- **Live Feed** (`/`) — alerts streaming in over WebSocket, newest first,
+  colour-coded by severity, filterable, click through to any alert.
+- **Drill-down** (`/alerts/<alertId>`) — the transaction, which rules
+  fired (or "flagged by the anomaly model alone"), the top 3 contributing
+  features as bar charts, an OpenStreetMap embed of where it happened, the
+  customer's other recent alerts, and the disposition form.
+- **Metrics** (`/metrics`) — the same alerts/day, per-rule precision, mean
+  time to disposition, and false-positive-rate trend the API exposes.
+
+Verified in an actual browser against the live stack end-to-end, including
+submitting a real disposition and watching the metrics page update from it.
+
+```bash
+cd serving/analyst-console
+npm install
+NEXT_PUBLIC_API_BASE_URL=http://localhost:3001 npm run dev   # local dev, without Docker
+```
 
 ## The generator, in more detail
 
@@ -502,11 +533,56 @@ breaks the cycle without reaching for `forwardRef()`.
 
 **What "drill-down" can and can't show yet.** The build plan's console
 mock-up includes "the customer's last 20 transactions for context" and a
-map of recent geo activity. This service can offer a customer's other
-*alerts* (`GET /alerts/:alertId` returns `recentForCustomer`), but not
-their full transaction history — that requires a queryable transaction
-store, which is the Delta Lake bronze layer's job (still Phase 4/planned),
-not something to fake with an ad-hoc Kafka read here.
+map of recent geo activity. The geo map is covered (the alert payload was
+extended end-to-end -- Spark's `alert_scoring.py` through to the
+console's `GeoEmbed` component -- to carry amount, channel, merchant, city,
+and lat/lon, not just the score and top features). Full transaction
+history isn't: this service can offer a customer's other *alerts*
+(`GET /alerts/:alertId` returns `recentForCustomer`), but not their
+non-alerted transactions too, which needs a queryable transaction store --
+the Delta Lake bronze layer's job, still planned.
+
+## The analyst console, in more detail
+
+**Next.js pinned to 15.x, not 14.x.** `npm audit` flagged Next 14.2.5's
+transitive dependencies with a critical/high advisory range; upgrading to
+the latest 15.x line (rather than the `npm audit fix --force`-suggested
+jump to 16, a breaking change not worth taking mid-build) resolved all but
+one moderate/high advisory in PostCSS's CSS-stringify/sourcemap handling —
+a build-time-only code path that never processes attacker-controlled CSS
+in this project (`globals.css` is static and developer-authored), so it's
+accepted rather than chased into a major-version migration.
+
+**No charting library, on purpose.** Three bars showing top feature
+z-scores, and a handful of stat tiles and a sparkline on the metrics page,
+don't need Recharts or D3 -- `TopFeaturesBars` and the metrics
+sparkline are a few dozen lines of divs scaled by percentage width/height.
+"Functional over beautiful" cuts both ways: it also means not reaching for
+machinery a raw `<div style={{width: pct+'%'}}>` already does.
+
+**No mapping library either.** `GeoEmbed` is a plain OpenStreetMap iframe
+(`/export/embed.html?bbox=...&marker=...`) — no API key, no
+react-leaflet, no tile-server config. A drill-down that needed multiple
+markers, clustering, or interaction would justify a real mapping library;
+"where did this one transaction happen" doesn't.
+
+**`useParams()`, not the `params` prop.** Next.js 15 made a page
+component's `params` prop a `Promise`, intended for `async` Server
+Components that can `await` it. The drill-down page is a Client Component
+(it owns a WebSocket subscription and the disposition form's interactive
+state), and client components can't be `async` functions -- reaching for
+`params` as a prop here would mean unwrapping a Promise with `React.use()`
+for no benefit. `useParams()` from `next/navigation` reads the same route
+param synchronously from client router state instead, which is both less
+code and the more direct tool for a component that was never going to be
+a Server Component in the first place.
+
+**One socket, not one per page.** `getSocket()` is a module-level
+singleton, not a connection opened inside a `useEffect` on every page that
+needs live updates. Navigating from the live feed to a drill-down page (or
+opening a second tab) doesn't multiply WebSocket connections to the alert
+service -- every consumer just adds and removes its own listeners on the
+one shared connection.
 
 ## Common mistakes
 

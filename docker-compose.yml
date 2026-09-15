@@ -152,6 +152,20 @@ services:
       CORS_ORIGIN: "*"
       KAFKAJS_NO_PARTITIONER_WARNING: "1"
 
+  analyst-console:
+    build:
+      context: ./serving/analyst-console
+      args:
+        # baked into the client bundle at build time -- must be the
+        # alert-service's host-mapped port, since this bundle runs in the
+        # analyst's browser, not inside the Docker network.
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:3001
+    container_name: pulseguard-analyst-console
+    ports:
+      - "3000:3000"
+    depends_on:
+      - alert-service
+
 volumes:
   kafka_data:
   redis_data:

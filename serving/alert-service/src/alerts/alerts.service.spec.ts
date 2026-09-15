@@ -26,6 +26,13 @@ const KAFKA_MESSAGE = {
   topFeatures: [{ name: 'impliedSpeedKmh', value: 3000, zScore: 12.4 }],
   trailingMean: 500,
   trailingMax: 2000,
+  amount: 25000,
+  channel: 'CARD',
+  merchantId: 'M001',
+  merchantCategory: 'TRAVEL',
+  city: 'Delhi',
+  lat: 28.7041,
+  lon: 77.1025,
 };
 
 describe('AlertsService', () => {
