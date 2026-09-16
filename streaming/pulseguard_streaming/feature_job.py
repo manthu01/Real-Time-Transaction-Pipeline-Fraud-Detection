@@ -290,10 +290,10 @@ def main(argv: list[str] | None = None) -> None:
     valid, invalid = split_valid_and_invalid(raw)
     valid_with_watermark = valid.withWatermark("timestamp", WATERMARK_DELAY)
 
-    write_dead_letter(invalid, args.bootstrap_servers, args.dead_letter_topic, args.checkpoint_dir, args.trigger_interval)
+    queries = [write_dead_letter(invalid, args.bootstrap_servers, args.dead_letter_topic, args.checkpoint_dir, args.trigger_interval)]
 
     if args.enable_window_demo:
-        start_window_demo_query(valid_with_watermark, args.trigger_interval)
+        queries.append(start_window_demo_query(valid_with_watermark, args.trigger_interval))
 
     # feature_stream is consumed by up to three independent writeStream
     # queries below (Redis + alerts + bronze). Spark re-executes
@@ -303,17 +303,21 @@ def main(argv: list[str] | None = None) -> None:
     # independently restartable instead of adding an intermediate Kafka
     # topic just to fan the stream out once.
     feature_stream = compute_feature_stream(valid_with_watermark)
-    write_features_to_redis(
-        feature_stream, args.redis_host, args.redis_port, args.redis_ttl_seconds, args.checkpoint_dir, args.trigger_interval
+    queries.append(
+        write_features_to_redis(
+            feature_stream, args.redis_host, args.redis_port, args.redis_ttl_seconds, args.checkpoint_dir, args.trigger_interval
+        )
     )
 
     if args.enable_bronze:
-        write_bronze_to_delta(feature_stream, args.bronze_path, args.checkpoint_dir, args.trigger_interval)
+        queries.append(write_bronze_to_delta(feature_stream, args.bronze_path, args.checkpoint_dir, args.trigger_interval))
 
     if args.enable_detection:
         if (Path(args.detection_artifacts_dir) / "threshold.json").exists():
             alerts_stream = score_alerts_stream(feature_stream, args.detection_artifacts_dir)
-            write_alerts_to_kafka(alerts_stream, args.bootstrap_servers, args.alerts_topic, args.checkpoint_dir, args.trigger_interval)
+            queries.append(
+                write_alerts_to_kafka(alerts_stream, args.bootstrap_servers, args.alerts_topic, args.checkpoint_dir, args.trigger_interval)
+            )
         else:
             print(
                 f"WARNING: no trained detection artifacts found at {args.detection_artifacts_dir} "
@@ -323,8 +327,21 @@ def main(argv: list[str] | None = None) -> None:
 
     # blocks until any one of the queries above stops (normally only on
     # failure or a driver shutdown) so a crash in one query surfaces instead
-    # of the job silently limping along on the others.
+    # of the job silently limping along on the others. Recoverable failure
+    # modes (a Redis outage, a malformed record) are handled *before* they
+    # reach this point -- see redis_writer.write_partition and
+    # split_valid_and_invalid -- so a query actually terminating here means
+    # something genuinely unexpected happened.
     spark.streams.awaitAnyTermination()
+
+    # spark.streams.active only lists queries still running, so the one
+    # that just stopped has to be found by checking every handle this
+    # function started -- not by re-querying Spark's own active-query list.
+    failed = [q for q in queries if q.exception() is not None]
+    if failed:
+        for q in failed:
+            print(f"FAILING LOUDLY: streaming query '{q.name}' terminated with exception: {q.exception()}")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

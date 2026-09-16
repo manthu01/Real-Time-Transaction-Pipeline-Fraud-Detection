@@ -49,9 +49,13 @@ implemented and tested; unchecked items are planned.
         computing gold aggregates, PSI drift, data quality gates, and a
         report-only champion-vs-challenger retrain check — verified against
         real bronze data, including two real bugs it surfaced along the way.
-- [ ] **Phase 5 — Load testing & failure drills.** Throughput and latency
-      numbers under load, plus documented recovery from executor kills,
-      Redis outages, and malformed records.
+- [x] **Phase 5 — Load testing & failure drills.** Real measured throughput
+      and latency numbers (including a full-pipeline bottleneck that isn't
+      what the raw producer numbers suggest), a driver-kill drill with a
+      global zero-loss/zero-duplication check, a Redis-outage drill that
+      exposed and fixed a real crash-vs-degrade bug, and a dead-letter
+      drill — see below for all of it, including two more real bugs found
+      by actually running these tests rather than assuming they'd pass.
 
 ## Architecture
 
@@ -688,6 +692,208 @@ data accumulated across this project's own testing (49,644 rows):
   isn't automatically better data, and a nightly job that blindly
   retrained-and-deployed on whatever showed up would have made the
   production model worse.
+
+## Load testing and failure drills
+
+Everything in this section is a number or an outcome actually observed
+running against the live Docker stack on this machine (`local[2]` --
+2 Spark cores, one broker, one Redis instance), not an estimate. Per the
+build plan's own admonition, and because it turned out to matter: none of
+these numbers are what I would have guessed going in.
+
+### The headline finding: three consumers cost roughly 15-40x, not 3x
+
+`feature_job.py`'s own code comment already documents the tradeoff --
+`feature_stream` is consumed by three independent `writeStream` queries
+(Redis, Delta bronze, `fraud.alerts`), and Spark re-executes
+`applyInPandasWithState` separately for each, recomputing the same 26
+features three times rather than sharing one state store. I assumed that
+meant "roughly 3x the cost." Measuring it said otherwise:
+
+| Configuration | Rate tested | Result |
+|---|---|---|
+| Full pipeline (Redis + bronze + alerts) | 20 tx/s (accurately paced) | Batches took 7-24s against a 5s trigger -- falling behind immediately, unboundedly |
+| Isolated (Redis only) | 20, 100, 300 tx/s | Zero "falling behind" batches at any of these |
+| Isolated (Redis only) | 800 tx/s | Two batches marginally over (5.4s, 5.3s vs. 5.0s trigger) -- the first sign of strain |
+
+The full pipeline can't sustainably clear even 20 tx/s; removing two of
+three consumers and keeping everything else identical clears 300 tx/s
+without a single missed trigger and only starts to strain around 800.
+That's not a 3x difference, it's closer to 15-40x -- Python UDF overhead,
+GIL contention across `local[2]`'s two cores, and per-partition Redis I/O
+each get paid three times over, and at this deployment's resource scale
+that compounds rather than adding linearly. **What this means, honestly:**
+the "recompute vs. materialize once" tradeoff documented in `feature_job.py`
+is real and worth being able to explain in an interview, but at production
+scale the fix is exactly what the code comment says it isn't doing yet --
+materialize `feature_stream` to one intermediate topic or table once, and
+have Redis/bronze/alerts all read from *that*, or give the job more cores
+than a laptop's `local[2]`. Both are legitimate next steps; neither was
+free to skip.
+
+### End-to-end latency (full pipeline, 20 tx/s, accurately paced)
+
+Measured as `alertPublishTime - transactionTimestamp` from a Kafka
+consumer probe reading `fraud.alerts` directly (its own consumer group,
+`auto.offset.reset=latest`, so it only sees new alerts, not backlog
+replay):
+
+| Percentile | Latency |
+|---|---|
+| p50 | 10.6 s |
+| p95 | 15.1 s |
+| p99 | 16.2 s |
+| max | 16.8 s |
+
+Ten-plus seconds of median latency at a rate the pipeline can't actually
+sustain is the expected shape of a growing backlog, not a flat processing
+cost -- it's the same underlying finding as the throughput numbers above,
+seen from the consumer's side instead of the producer's side.
+
+### A real bug the load test itself was built on: the generator's own rate limiter
+
+Before any of the numbers above could be trusted, the generator's
+`loadtest` pacing loop turned out to be wrong. It slept for
+`min(next_due - now, 0.01)` -- capped at 10ms -- but then advanced the
+schedule by a full interval regardless of whether that sleep actually
+closed the gap:
+
+```python
+if now < next_due:
+    time.sleep(min(next_due - now, 0.01))   # capped at 10ms...
+next_due += target_interval                  # ...but scheduled as if it wasn't
+```
+
+For any target rate below 100 tx/s (where the true required gap exceeds
+10ms), this silently under-slept every iteration and the loop raced ahead
+of its own schedule. `--rate 20` measured **84-93 achieved tx/s** before
+the fix -- an inaccuracy that would have gone completely unnoticed if
+"looks roughly load-test-shaped" had been the bar instead of "achieved_tps
+printed at the end must match what was asked for," which the plan's own
+"never claim a number you haven't measured" instruction exists to force.
+Fixed by looping the sleep until `next_due` is actually reached; a
+regression test now runs a short real load test and asserts the achieved
+rate lands within tolerance of the target, at both a rate the old bug
+broke badly (20) and one it broke less obviously (60).
+
+### Failure drills
+
+**1. Kill Redis mid-stream.** Stopped the Redis container while ~100 tx/s
+of traffic was flowing. Before this drill, this would have taken the
+*entire* pipeline down with it: `redis_writer.write_partition` had no
+error handling, so a `RedisError` would propagate out of
+`foreachPartition`, fail the Spark task, fail the "features → Redis"
+query, and -- because `feature_job.main()` used
+`spark.streams.awaitAnyTermination()` with no exception check afterward --
+unblock that call and let the driver process exit cleanly-looking, even
+though a query had actually crashed, silently taking the still-healthy
+alerts and bronze queries down with it. Fixed in two places:
+`write_partition` now catches `redis.exceptions.RedisError` specifically
+and logs a warning instead of raising (four new tests cover this,
+including one confirming a *non*-Redis exception still propagates --
+only the expected, recoverable failure mode is swallowed), and `main()`
+now checks every query's `.exception()` after `awaitAnyTermination()`
+returns and exits non-zero if any query actually failed, so a genuinely
+unexpected crash still surfaces loudly instead of looking like a clean
+stop.
+
+With the fix: killing Redis produced zero exceptions, the container
+stayed up, and `fraud.alerts` grew by ~9,650 messages *during* the
+outage -- rule/model scoring reads the Spark-managed checkpointed state
+directly, never Redis, so alerting kept running at full fidelity
+throughout. Restarting Redis resumed feature-store writes automatically,
+no manual intervention. The one honest cost: batches slowed down while
+Redis was unreachable (DNS resolution failing per partition adds real
+wall-clock time before the 2-second connect timeout gives up), so
+"degrades, doesn't crash" is accurate, but "degrades for free" isn't --
+a production system would want a circuit breaker to stop attempting
+Redis writes after the first few failures rather than retrying every
+partition every batch.
+
+**2. Publish malformed records.** Sent a burst with a 10% deliberately
+malformed rate (a required field dropped per record, reusing the
+generator's existing `--malformed-rate` flag from Phase 1/2). `dead.letter`
+grew by 82 messages against ~88 expected; the job logged zero exceptions
+and kept processing everything else. This was already demonstrated in
+Phase 2's initial build; re-run here specifically to confirm it still
+holds after everything else that changed since.
+
+**3. Kill the driver mid-batch, verify no loss or duplication.** `local[2]`
+runs executors as threads inside the driver JVM, so there's no separate
+executor process to kill independently the way a multi-node cluster would
+have -- the equivalent, and arguably more relevant, failure mode for this
+deployment is killing the whole driver container. Sent a burst (1,201
+transactions), `docker kill`'d the container mid-processing (not a
+graceful stop), sent a second burst while it was down (801 more --
+confirming Kafka's durability doesn't care whether anything is consuming),
+then restarted it. The checkpoint's last committed offset, once caught up,
+matched the topic's end offset **exactly**, and a global check across the
+*entire* bronze table (not just this drill's narrow time window, which
+turned out to have its own timestamp-boundary measurement noise) gave:
+
+```
+raw.transactions total:  70,588
+dead.letter total:          135
+bronze total rows:       70,453   =  70,588 − 135, exactly
+bronze distinct txnIds:  70,453   =  zero duplicates
+```
+
+Every non-malformed transaction ever produced across this project's
+entire testing history landed in bronze exactly once, including across an
+abrupt kill mid-batch. That's the practical meaning of "exactly-once" this
+project can actually demonstrate, not just assert.
+
+**4. Stop the consumer, restart, verify lag recovery.** Mechanically the
+same evidence as drill 3 -- the checkpoint resumed from its last committed
+offset per partition and caught up to the new topic end without
+intervention or reprocessing. The two are the same recovery mechanism
+regardless of whether the interruption was graceful or a `SIGKILL`; drill
+3 demonstrates the harder case.
+
+### Exactly-once, precisely
+
+The build plan's own advice is to be able to state this mechanism exactly,
+not gesture at it -- and having now tested it against a real abrupt kill,
+here's what's actually true, including the parts that are "effectively
+exactly-once" rather than transactionally guaranteed:
+
+- **Kafka source offsets are committed to the Spark checkpoint, not to a
+  Kafka consumer group.** Verified directly, not assumed: `checkpoints/bronze/offsets/<N>`
+  contains a literal per-partition offset map, and after drill 3, that map
+  matched the topic's end offsets exactly.
+- **Redis writes are naturally idempotent.** Each write is a full
+  `HSET` of a customer's current feature snapshot, keyed by `customerId`,
+  not an append or increment -- replaying the same micro-batch twice
+  produces the same end state, not a duplicate.
+- **Delta bronze writes are atomic per micro-batch**, via Delta's
+  transaction log -- a batch either fully commits or leaves no partial
+  trace, which is what prevents a crash mid-write from leaving bronze in
+  a half-written state. It is *not* configured with Delta's explicit
+  `txnAppId`/`txnVersion` idempotent-write API, which is the piece that
+  would guarantee a *retried* batch (Spark's checkpoint advances the
+  offset, then crashes before recording that this specific batch's Delta
+  write already succeeded) can't double-write. That's a real, named gap,
+  not a hidden one -- the global zero-duplicate result above shows it
+  didn't happen in this project's testing (including one abrupt kill),
+  but "didn't happen in testing" and "can't happen" are different claims,
+  and only the first one is true here today.
+- **The `fraud.alerts` and `dead.letter` Kafka sinks are at-least-once**,
+  not exactly-once, at the write level -- Spark's plain Kafka sink isn't
+  wrapped in a transactional producer the way the Delta sink gets atomic
+  commits for free. What actually makes the *effect* exactly-once is
+  downstream: the alert service's `ingestFromKafka` upserts by `alertId`
+  (see `serving/alert-service`), so a duplicate alert message -- if a
+  retry ever produced one -- is a no-op on arrival, not a second row.
+
+Put together: this system does not have one unified transactional
+guarantee spanning every hop from Kafka to Postgres. It has checkpoint-
+ordered offset commits, one genuinely atomic sink (Delta), one naturally
+idempotent sink (Redis), and one at-least-once sink whose duplicates are
+absorbed by an idempotent consumer (the alert service). That combination
+is what "exactly-once" means in most real streaming systems that claim
+it, and being able to say which piece provides which guarantee -- rather
+than "we use checkpoints so it's exactly-once" -- is the difference the
+build plan is pointing at.
 
 ## Common mistakes
 

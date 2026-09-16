@@ -88,9 +88,19 @@ def cmd_loadtest(args) -> None:
 
     for txn in stream:
         if target_interval > 0:
+            # Sleep in short bounded increments until next_due is actually
+            # reached, rather than one capped attempt -- a single
+            # `sleep(min(gap, 0.01))` followed by advancing next_due by a
+            # full interval regardless silently under-slept (and the loop
+            # raced ahead of schedule) for any target_interval > 10ms, i.e.
+            # any rate below 100 tps. That's exactly the "measure your
+            # actual rate, don't claim a number you haven't hit" trap the
+            # build plan warns about, just inside our own tooling: rate=50
+            # was measurably achieving ~93 tps before this fix.
             now = time.monotonic()
-            if now < next_due:
-                time.sleep(min(next_due - now, 0.01))
+            while now < next_due:
+                time.sleep(min(next_due - now, 0.05))
+                now = time.monotonic()
             next_due += target_interval
 
         sink.send(txn)

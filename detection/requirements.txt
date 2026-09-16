@@ -1,4 +1,13 @@
-scikit-learn>=1.5
+# pinned exactly (not >=) to match the version baked into the serving
+# containers (streaming/Dockerfile, analytics/Dockerfile) -- training
+# locally with a newer scikit-learn than the container that unpickles the
+# model produces a real, if usually harmless, InconsistentVersionWarning
+# at serving time. Observed in this project: a model trained with 1.7.2
+# loaded and scored correctly under 1.5.2 for the session's full test
+# run, but that's not a guarantee for every future scikit-learn release,
+# and it's not something to find out about by reading a warning that
+# happens to look benign.
+scikit-learn==1.5.2
 lightgbm>=4.5
 pandas>=2.2
 numpy>=2.0
