@@ -96,6 +96,7 @@ services:
     volumes:
       - spark_checkpoints:/opt/pulseguard/checkpoints
       - spark_ivy_cache:/root/.ivy2
+      - delta_lake:/opt/pulseguard/delta
       # trained model artifacts are a host-side, gitignored build output
       # (see detection/README) -- bind-mounted read-only rather than baked
       # into the image, so retraining a new "champion" doesn't require a
@@ -105,7 +106,7 @@ services:
     command:
       - /opt/spark/bin/spark-submit
       - --packages
-      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0,io.delta:delta-core_2.12:2.4.0
       - --master
       - local[2]
       - pulseguard_streaming/feature_job.py
@@ -166,9 +167,46 @@ services:
     depends_on:
       - alert-service
 
+  # Not started by `docker compose up` -- this is the build plan's
+  # "cron-triggered Python script" standing in for Airflow. In a real
+  # deployment, cron or Airflow invokes this on a schedule; here it's run
+  # by hand: `docker compose run --rm nightly-batch` (see README).
+  nightly-batch:
+    build:
+      context: .
+      dockerfile: analytics/Dockerfile
+    container_name: pulseguard-nightly-batch
+    profiles: ["batch"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - spark_ivy_cache:/root/.ivy2
+      - delta_lake:/opt/pulseguard/delta
+      - ./detection/artifacts:/opt/pulseguard/detection-artifacts:ro
+      - ./analytics/output:/opt/pulseguard/analytics-output
+    command:
+      - /opt/spark/bin/spark-submit
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0,io.delta:delta-core_2.12:2.4.0
+      - --master
+      - local[2]
+      - pulseguard_analytics/nightly_job.py
+      - --bronze-path
+      - /opt/pulseguard/delta/bronze
+      - --gold-path
+      - /opt/pulseguard/delta/gold
+      - --bootstrap-servers
+      - kafka:19092
+      - --detection-artifacts-dir
+      - /opt/pulseguard/detection-artifacts
+      - --output-dir
+      - /opt/pulseguard/analytics-output
+
 volumes:
   kafka_data:
   redis_data:
   postgres_data:
   spark_checkpoints:
   spark_ivy_cache:
+  delta_lake:

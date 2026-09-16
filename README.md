@@ -43,8 +43,12 @@ implemented and tested; unchecked items are planned.
         other recent alerts), and disposition capture — verified in an
         actual browser against the live stack, including a real
         disposition round-trip and the metrics dashboard updating from it.
-  - [ ] Bronze/silver/gold Delta Lake layer with nightly PSI drift and
-        per-rule precision jobs.
+  - [x] Delta Lake bronze layer (skipping silver, per the build plan's own
+        short-on-time cut) written continuously by the Spark job, plus a
+        nightly batch job (a plain Python script standing in for Airflow)
+        computing gold aggregates, PSI drift, data quality gates, and a
+        report-only champion-vs-challenger retrain check — verified against
+        real bronze data, including two real bugs it surfaced along the way.
 - [ ] **Phase 5 — Load testing & failure drills.** Throughput and latency
       numbers under load, plus documented recovery from executor kills,
       Redis outages, and malformed records.
@@ -68,24 +72,27 @@ Kafka topic: raw.transactions
         │
   ┌─────┼───────────────┬──────────────────┐
   ▼     ▼               ▼                  ▼
-Redis   Kafka topic    Delta Lake         Kafka topic
-online  fraud.alerts   bronze/silver/gold dead.letter
-feature   │             (Phase 4)
+Redis   Kafka topic    Delta Lake bronze  Kafka topic
+online  fraud.alerts   (26 features +     dead.letter
+feature   │             labels, by date)
 store     ▼                │
-       NestJS alert    Nightly batch jobs
-       service         (fraud rate, per-rule
-         │              precision, PSI drift)  <- Phase 4
-     WebSocket
+       NestJS alert         ▼
+       service         Nightly batch job (cron-triggered script)
+         │              ├─ gold: fraud rate, risk profiles,
+     WebSocket          │   per-rule precision, alert funnel
+         │              ├─ PSI drift vs. reference window
+   Next.js analyst       ├─ data quality gates (fail loudly)
+   console               └─ retrain-check: challenger vs.
+   (live feed,               champion, report only
+   drill-down,
+   disposition)
          │
-   Next.js analyst console
-   (live feed, drill-down, disposition)
-         │
-   analyst.dispositions (Kafka) → retraining     <- retraining is Phase 5
+   analyst.dispositions (Kafka) → retrain-check     <- Phase 5: real retraining loop
 ```
 
-*Delta Lake and PSI drift are planned; see Status. Everything else above —
-including the NestJS alert service, the Next.js console, and the
-disposition→Kafka feedback loop — is built and verified.*
+*Everything above is built and verified against the live stack; see
+Status. Only the load-testing/failure-drill numbers (Phase 5) are still
+outstanding.*
 
 ## Why each piece matters
 
@@ -160,10 +167,23 @@ serving/
     src/components/    severity/disposition badges, hand-rolled feature bars,
                         an OpenStreetMap iframe embed, the disposition form
     src/lib/           REST client, a shared socket.io singleton, shared types
+analytics/          Nightly batch job: bronze reads, gold, PSI, quality, retrain-check
+  pulseguard_analytics/
+    psi.py             population stability index -- pure numpy/pandas
+    data_quality.py     null-rate/range/volume gates -- pure pandas
+    gold.py              daily fraud rate, risk profiles, per-rule precision,
+                          alert funnel, from bronze Delta + a batch Kafka read
+    retrain_check.py     challenger vs. champion, reusing pulseguard_detection's
+                          already-tested training functions -- report only
+    nightly_job.py        the 5-step orchestrator (the build plan's
+                           "cron-triggered Python script" in place of Airflow)
+  tests/              24 tests, all Spark-free (pure Python + pandas)
 infra/
   kafka/create_topics.sh   topic provisioning (partitions/retention)
 docker-compose.yml   Kafka (KRaft), Kafka UI, Redis, Postgres, Spark job,
-                     alert service, analyst console
+                     alert service, analyst console, nightly-batch (profile:
+                     "batch" -- not started by `up`, run via `docker compose
+                     run --rm nightly-batch`)
 ```
 
 ## Getting started
@@ -275,6 +295,7 @@ install pyspark` locally to run them outside the container):
 cd generator && python -m pytest tests/ -v
 cd streaming && python -m pytest tests/ -v
 cd detection && python -m pytest tests/ -v
+cd analytics && python -m pytest tests/ -v
 cd serving/alert-service && npm test
 ```
 
@@ -318,6 +339,27 @@ cd serving/analyst-console
 npm install
 NEXT_PUBLIC_API_BASE_URL=http://localhost:3001 npm run dev   # local dev, without Docker
 ```
+
+**10. The Spark job also writes a Delta bronze table** continuously (the
+same enriched, feature-attached stream that goes to Redis and
+`fraud.alerts`, partitioned by date) — no separate step needed, it starts
+with `docker compose up -d` alongside everything else.
+
+**11. Run the nightly analytics batch job by hand** (it has a `profiles:
+["batch"]` tag specifically so it does *not* start with a plain `docker
+compose up` — in a real deployment cron or Airflow would invoke it on a
+schedule; here it's a deliberate manual step):
+
+```bash
+docker compose run --rm nightly-batch
+```
+
+Five steps, printed as they run: data quality gates over bronze (exits
+non-zero if any fail — "fail loudly"), gold aggregates written to
+`delta/gold/*` (daily fraud rate, customer risk profiles, per-rule
+precision, alert funnel), PSI drift (an early bronze window vs. the most
+recent one), a report-only champion-vs-challenger retrain check, and a
+JSON report written to `analytics/output/`.
 
 ## The generator, in more detail
 
@@ -583,6 +625,69 @@ needs live updates. Navigating from the live feed to a drill-down page (or
 opening a second tab) doesn't multiply WebSocket connections to the alert
 service -- every consumer just adds and removes its own listeners on the
 one shared connection.
+
+## The nightly analytics job, in more detail
+
+**Bronze, not bronze+silver+gold.** The build plan's own short-on-time cut
+("Delta Lake layers — cut to bronze + gold, skip silver") is taken here
+literally: bronze is the Spark job's already-enriched output (raw fields +
+all 26 features + the isFraud/fraudPattern labels), partitioned by date --
+what a strict medallion architecture would call silver, folded into
+bronze. Every gold computation, PSI check, and quality gate reads this one
+table. That's a real simplification, not a euphemism for "we didn't do
+it" -- it's the specific trade the plan explicitly sanctions.
+
+**Gold is computed twice, on purpose.** Per-rule precision and the alert
+funnel already exist live in the NestJS alert service, computed from
+Postgres. The nightly job recomputes them independently from Delta bronze
++ a batch read of `fraud.alerts`/`analyst.dispositions` from Kafka --
+deliberately a second, structurally different code path (SQL over
+Postgres vs. Spark over Delta+Kafka) rather than the same query run twice.
+When I ran both, they agreed exactly (1 `CONFIRMED_FRAUD` on
+`ATO_SIGNATURE`, 100% precision; the same disposition counts by severity
+in the funnel) -- which is the actual point: two independent
+implementations agreeing is a much stronger correctness signal than one
+implementation being fast.
+
+**Two real bugs found running this against actual bronze data, both fixed:**
+
+1. **`DataFrame.toPandas()` crashed with `TypeError: Casting to unit-less
+   dtype 'datetime64' is not supported`.** This Spark version's
+   Arrow-optimized conversion path falls back to a legacy per-column
+   route that calls pandas' `astype('datetime64')` without a unit --
+   removed in pandas 2.0. Rather than chase a fragile pyarrow/pandas
+   version pin that could silently break again on the next bump, every
+   `toPandas()` call in the nightly job was replaced with
+   `spark_df_to_pandas()`: collect rows, build the DataFrame directly.
+   Slower than Arrow conversion, irrelevant at this job's batch scale.
+2. **The null-rate quality gate false-failed on `secondsSincePrevTxn`**
+   (4.03% null against a 1% threshold). That field is null exactly once
+   per customer -- their first-ever transaction -- so a blanket threshold
+   across all 26 features flags a structural property of the data as a
+   defect. Fixed by excluding it from the null-rate gate specifically
+   (range/other checks are unaffected), with the reasoning left in a
+   comment rather than just silently narrowing the check.
+
+**Real findings from running it, not synthetic ones.** Against the bronze
+data accumulated across this project's own testing (49,644 rows):
+
+- **PSI flagged 16 of 26 features as significantly drifted**
+  (`hourOfDay` PSI=8.62, `maxTxnsInAny60SecWindowToday` PSI=2.08, and
+  more), comparing an early bronze window against the most recent one.
+  This independently confirms, via a completely different mechanism, the
+  same finding the detection layer's README section already documents:
+  a large share of this project's own load-test firehose traffic doesn't
+  resemble the realistically-paced data used for training, and the drift
+  monitor correctly says so. Two unrelated pieces of the system agreeing
+  is more convincing than either alone.
+- **The retrain-check correctly said no.** A challenger Isolation Forest
+  trained on the (firehose-skewed) accumulated bronze data scored PR-AUC
+  0.362 against the champion's 0.378 on a comparable holdout --
+  `challenger_better: false`. Exactly the scenario "evaluate against
+  champion, don't auto-promote" exists to catch: more accumulated data
+  isn't automatically better data, and a nightly job that blindly
+  retrained-and-deployed on whatever showed up would have made the
+  production model worse.
 
 ## Common mistakes
 

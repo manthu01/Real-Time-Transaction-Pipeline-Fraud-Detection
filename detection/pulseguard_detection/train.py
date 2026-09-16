@@ -27,9 +27,9 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import joblib
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
@@ -38,6 +38,13 @@ from sklearn.metrics import average_precision_score, precision_score, recall_sco
 from pulseguard_detection.dataset import FEATURE_NAMES, build_feature_dataset_from_jsonl, feature_matrix
 from pulseguard_detection.rule_engine import evaluate_rules, load_rules
 from pulseguard_detection.threshold import recall_at_threshold, select_threshold_for_capacity, trade_off_curve
+
+if TYPE_CHECKING:
+    # only pulseguard_detection.train's own module-level type hints need
+    # this; callers that just want the Isolation Forest side (e.g. the
+    # nightly analytics retrain-check) shouldn't have to install lightgbm
+    # to import this module at all.
+    import lightgbm as lgb
 
 DEFAULT_ARTIFACTS_DIR = Path(__file__).parent.parent / "artifacts"
 
@@ -84,6 +91,8 @@ def train_lightgbm(train_df: pd.DataFrame, val_fraction: float = 0.15) -> lgb.LG
     ~300-object minority class. Reporting `best_iteration_` in the metrics
     output is the honest way to surface that rather than hide it.
     """
+    import lightgbm as lgb
+
     inner_train, val = time_split(train_df, 1 - val_fraction)
     X_tr, y_tr = feature_matrix(inner_train).fillna(0.0), inner_train["isFraud"].astype(int)
     X_val, y_val = feature_matrix(val).fillna(0.0), val["isFraud"].astype(int)

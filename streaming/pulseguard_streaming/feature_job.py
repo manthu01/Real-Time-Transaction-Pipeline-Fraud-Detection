@@ -52,6 +52,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--detection-artifacts-dir", default="/opt/pulseguard/detection-artifacts")
     p.add_argument("--enable-detection", action="store_true", default=True)
     p.add_argument("--no-detection", dest="enable_detection", action="store_false", help="skip rule+model scoring, e.g. if artifacts haven't been trained yet")
+    p.add_argument("--bronze-path", default="/opt/pulseguard/delta/bronze")
+    p.add_argument("--enable-bronze", action="store_true", default=True)
+    p.add_argument("--no-bronze", dest="enable_bronze", action="store_false", help="skip the Delta bronze write")
     return p.parse_args(argv)
 
 
@@ -60,6 +63,12 @@ def build_spark(app_name: str = "pulseguard-feature-job") -> SparkSession:
         SparkSession.builder.appName(app_name)
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.shuffle.partitions", "6")
+        # Delta Lake session extensions -- needed for the bronze table
+        # write below, and shared with the nightly analytics batch job
+        # (pulseguard_analytics), which reads this same bronze table and
+        # therefore builds its SparkSession the same way.
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
         .getOrCreate()
     )
 
@@ -226,6 +235,28 @@ def write_features_to_redis(
     )
 
 
+def write_bronze_to_delta(feature_stream: DataFrame, bronze_path: str, checkpoint_dir: str, trigger_interval: str):
+    """The bronze layer: the enriched, feature-attached transaction stream
+    (raw fields + all 26 features + the isFraud/fraudPattern labels),
+    append-only, partitioned by date. This is a deliberate simplification
+    of the build plan's bronze/silver/gold split -- bronze here already
+    carries the computed features a strict "raw, schema-on-read" bronze
+    layer wouldn't, folding what would be a separate silver stage into
+    one table. That trade is explicitly sanctioned by the plan's own
+    short-on-time cut ("bronze + gold, skip silver"), and here it's the
+    nightly analytics job's only read path: per-rule precision, PSI
+    drift, and data-quality checks all read this one table."""
+    bronze = feature_stream.withColumn("date", F.to_date(F.col("timestamp")))
+    return (
+        bronze.writeStream.format("delta")
+        .option("checkpointLocation", f"{checkpoint_dir}/bronze")
+        .partitionBy("date")
+        .trigger(processingTime=trigger_interval)
+        .outputMode("append")
+        .start(bronze_path)
+    )
+
+
 def score_alerts_stream(feature_stream: DataFrame, artifacts_dir: str) -> DataFrame:
     """Runs the trained rules+model scoring function (pulseguard_detection)
     over every enriched transaction, keeping only the ones that actually
@@ -264,16 +295,20 @@ def main(argv: list[str] | None = None) -> None:
     if args.enable_window_demo:
         start_window_demo_query(valid_with_watermark, args.trigger_interval)
 
-    # feature_stream is consumed by two independent writeStream queries
-    # below (Redis + alerts). Spark re-executes applyInPandasWithState
-    # separately for each -- this recomputes the same feature values twice
-    # rather than sharing one state store, which is the accepted tradeoff
-    # here for keeping two independently-restartable sinks instead of
-    # adding an intermediate Kafka topic just to fan the stream out once.
+    # feature_stream is consumed by up to three independent writeStream
+    # queries below (Redis + alerts + bronze). Spark re-executes
+    # applyInPandasWithState separately for each -- this recomputes the
+    # same feature values two or three times rather than sharing one state
+    # store, which is the accepted tradeoff here for keeping each sink
+    # independently restartable instead of adding an intermediate Kafka
+    # topic just to fan the stream out once.
     feature_stream = compute_feature_stream(valid_with_watermark)
     write_features_to_redis(
         feature_stream, args.redis_host, args.redis_port, args.redis_ttl_seconds, args.checkpoint_dir, args.trigger_interval
     )
+
+    if args.enable_bronze:
+        write_bronze_to_delta(feature_stream, args.bronze_path, args.checkpoint_dir, args.trigger_interval)
 
     if args.enable_detection:
         if (Path(args.detection_artifacts_dir) / "threshold.json").exists():

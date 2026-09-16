@@ -39,6 +39,10 @@ detection/data/
 detection/artifacts/*.joblib
 detection/artifacts/lightgbm.txt
 
+# nightly analytics job output (JSON reports) -- regenerate with
+# `docker compose run --rm nightly-batch` (see README)
+analytics/output/*.json
+
 # OS / editor
 .DS_Store
 .idea/
