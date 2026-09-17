@@ -147,6 +147,29 @@ def evaluate_rules_on_holdout(fired_any: np.ndarray, labels: np.ndarray) -> dict
     }
 
 
+def detection_rate_per_pattern(holdout_df: pd.DataFrame, hybrid_flagged: np.ndarray, rules_fired: np.ndarray) -> dict:
+    """Recall broken down by which of the 6 injected fraud patterns each
+    holdout fraud row actually is -- the build plan asks for this
+    specifically because an aggregate recall number hides whether a
+    detector is strong everywhere or only on the easy patterns. Restricted
+    to rows where isFraud is true, since fraudPattern is null otherwise."""
+    fraud_rows = holdout_df[holdout_df["isFraud"]]
+    fraud_idx = fraud_rows.index.to_numpy()
+    hybrid_hit = pd.Series(hybrid_flagged, index=holdout_df.index).loc[fraud_idx]
+    rules_hit = pd.Series(rules_fired, index=holdout_df.index).loc[fraud_idx]
+
+    result = {}
+    for pattern, group in fraud_rows.groupby("fraudPattern"):
+        idx = group.index
+        n = len(idx)
+        result[pattern] = {
+            "holdout_count": int(n),
+            "hybrid_recall": float(hybrid_hit.loc[idx].sum() / n),
+            "rules_only_recall": float(rules_hit.loc[idx].sum() / n),
+        }
+    return result
+
+
 def false_positive_rate_at_recall(scores: np.ndarray, labels: np.ndarray, target_recall: float) -> float:
     """Sweeps thresholds to find the false-positive rate at the point
     where recall first reaches target_recall, for the model-only vs hybrid
@@ -230,6 +253,11 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  hybrid (rules OR model>=threshold): precision={hybrid_precision:.4f} recall={hybrid_recall:.4f} alert_rate={hybrid_alert_rate:.5%}")
     print(f"  false positive rate at matched recall ({hybrid_recall:.4f}): model-only={model_only_fpr_at_hybrid_recall:.4%} hybrid={hybrid_fpr:.4%}")
 
+    print("Breaking down detection rate per injected fraud pattern ...")
+    per_pattern = detection_rate_per_pattern(holdout_df, hybrid_flagged, rules_fired)
+    for pattern, stats in sorted(per_pattern.items()):
+        print(f"  {pattern}: n={stats['holdout_count']} hybrid_recall={stats['hybrid_recall']:.4f} rules_only_recall={stats['rules_only_recall']:.4f}")
+
     print("Building alerts/day vs fraud-caught trade-off curve ...")
     curve = trade_off_curve(iso_scores_holdout, labels_holdout, txns_per_day)
     curve.to_csv(artifacts_dir / "threshold_tradeoff.csv", index=False)
@@ -272,6 +300,7 @@ def main(argv: list[str] | None = None) -> None:
             "model_only_fpr": model_only_fpr_at_hybrid_recall,
             "hybrid_fpr": hybrid_fpr,
         },
+        "detection_rate_per_pattern": per_pattern,
     }
     (artifacts_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     print(f"\nArtifacts written to {artifacts_dir}/")

@@ -12,6 +12,14 @@ processing, watermarked late-event handling, exactly-once delivery via
 checkpointed offsets and idempotent sinks, and a single feature store shared
 between training and serving so the two never drift apart.
 
+![Live feed, drill-down, disposition, and metrics against the running stack](docs/demo.gif)
+
+*Recorded against the actual `docker compose up` stack: the live feed,
+opening an alert's drill-down (triggered rule, top contributing features,
+map, the customer's other recent alerts), submitting a real disposition
+(note + Confirmed Fraud), and the metrics page updating from it —
+`THRESHOLD_STRUCTURING`'s precision reflects that submission.*
+
 ## Status
 
 This project is being built incrementally, in phases. Checked items are
@@ -402,6 +410,24 @@ the watermarked sliding-window idiom (visible in `docker compose logs`),
 and, for the actual feature vector, a `applyInPandasWithState` operator
 maintaining one compact state object per customer.
 
+**The watermark (2 minutes) only actually gates the window-demo query,
+not the feature path — and that's deliberate, not an oversight worth
+hiding.** `applyInPandasWithState` here uses `GroupStateTimeout.ProcessingTimeTimeout`
+for idle-state cleanup, not an event-time timeout, so Spark's watermark
+doesn't filter rows out of the per-customer feature computation the way it
+does for the `groupBy(customerId, window(...))` demo query — an event
+arriving after the 2-minute mark still updates that customer's rolling
+features. On a real fraud-detection critical path that's the right
+trade-off (a late mobile transaction should still update the customer's
+velocity state, not vanish), but it does mean this project has not built
+the specific mechanism the build plan asks for -- counting watermark drops
+and routing them to a side output -- because on the feature path there is
+nothing to route: nothing gets dropped there. The one place a 2-minute-late
+event is genuinely excluded is the window-demo aggregation, and this
+project does not currently count or expose that number. That is a real,
+named gap against the build plan's explicit ask, not a mechanism that
+exists but goes unmentioned.
+
 **One state object, not a dozen counters.** Each customer's state is a
 bounded event-history buffer (pruned to 7 days, hard-capped at 3000 events
 regardless of age — the answer to "your state store grows unboundedly, how
@@ -455,48 +481,87 @@ combination, since a single bounded event-history buffer already gives an
 exact burst count).
 
 **Real numbers, measured on a 2000-customer/21-day synthetic dataset**
-(192,073 transactions, 447 labelled fraud, time-based 75/25 train/holdout
+(187,959 transactions, 333 labelled fraud, time-based 75/25 train/holdout
 split so nothing evaluates on data from before it was "trained"):
 
 | Metric | Value |
 |---|---|
-| Isolation Forest PR-AUC (unsupervised, holdout) | 0.378 |
-| LightGBM PR-AUC (supervised benchmark, holdout) | 0.936 |
-| Rules-only: precision / recall / alert rate | 0.092 / 0.747 / 1.40% |
-| Alert threshold, calibrated to 5 analysts × 40 reviews/day | 200 alerts/day → 2.17% alert rate |
-| Model-only at that threshold: precision / recall | 0.064 / 0.807 |
-| Hybrid (rules OR model≥threshold): precision / recall / alert rate | 0.048 / 0.819 / 2.98% |
-| False-positive rate at matched recall (0.819): model-only vs hybrid | 3.68% vs 2.84% |
+| Isolation Forest PR-AUC (unsupervised, holdout) | 0.457 |
+| LightGBM PR-AUC (supervised benchmark, holdout) | 0.864 |
+| Rules-only: precision / recall / alert rate | 0.082 / 0.823 / 1.33% |
+| Alert threshold, calibrated to 5 analysts × 40 reviews/day | 200 alerts/day → 2.21% alert rate |
+| Model-only at that threshold: precision / recall | 0.055 / 0.919 |
+| Hybrid (rules OR model≥threshold): precision / recall / alert rate | 0.040 / 0.919 / 3.02% |
+| False-positive rate at matched recall (0.919): model-only vs hybrid | 1.46% vs 2.90% |
 
 ![Alerts/day vs fraud caught](detection/artifacts/threshold_tradeoff.png)
+
+**Detection rate per injected fraud pattern**, on the same holdout
+(hybrid = rules OR model≥threshold; each pattern's `n` is how many holdout
+rows carry that label — small by construction, since only ~0.3% of
+generated volume is fraud in the first place):
+
+| Fraud pattern | n (holdout) | Rules-only recall | Hybrid recall |
+|---|---|---|---|
+| CARD_TESTING | 31 | 0.936 | 1.000 |
+| MULE_ACCOUNT | 16 | 0.875 | 1.000 |
+| SALAMI_SLICING | 7 | 0.286 | 0.571 |
+| GEO_IMPOSSIBLE_TRAVEL | 4 | 0.500 | 0.500 |
+| ACCOUNT_TAKEOVER | 2 | 1.000 | 1.000 |
+| MERCHANT_CATEGORY_ANOMALY | 2 | 1.000 | 1.000 |
+
+Two things worth saying about this table rather than just the numbers:
+the model closes real gaps the rules leave open on the higher-volume
+patterns (SALAMI_SLICING goes from catching 2 of 7 to 4 of 7; MULE_ACCOUNT
+and CARD_TESTING both reach 100% once the anomaly score backs up the
+rules), and GEO_IMPOSSIBLE_TRAVEL is the one pattern neither layer fully
+closes — with only 4 holdout examples, "50% recall" is one missed
+transaction, not a statistically meaningful weakness, but it's also not
+something to round up to a stronger claim than the data supports. The
+`ACCOUNT_TAKEOVER`/`MERCHANT_CATEGORY_ANOMALY` rows (n=2 each) are too
+small to draw any conclusion from at all beyond "both examples happened to
+be caught" — they're reported because the build plan asks for detection
+rate per pattern, not because n=2 tells you anything a bank would act on.
 
 A few things worth saying honestly about these numbers rather than letting
 them stand alone:
 
-- **LightGBM's PR-AUC (0.936) is high because the injected fraud patterns
+- **LightGBM's PR-AUC (0.864) is high because the injected fraud patterns
   are, by construction, extreme outliers** — an account takeover is 8-15x
   a customer's trailing mean at 2-4AM; that's an easy signal for a
   supervised model once it has labels. `best_iteration_: 1` (found via
   early stopping against a validation split carved from the *training*
   set, never the holdout) means a single boosting round already separates
-  the classes about as well as 1000 would — more rounds overfit the ~300
+  the classes about as well as 1000 would — more rounds overfit the ~250
   training examples of the minority class. This is a real, measured
   finding, not a hyperparameter picked because it flattered the holdout
   score.
-- **The Isolation Forest's lower PR-AUC (0.378) is the expected cost of
+- **The Isolation Forest's lower PR-AUC (0.457) is the expected cost of
   going unsupervised** — it has no labels to learn from and has to decide
   what's anomalous purely from the shape of normal behaviour. That gap
   *is* the answer to "what do you give up going unsupervised," and it's
   why the rules exist alongside it: rules give zero-latency, fully
   explainable coverage of the known patterns the unsupervised model is
   weakest on.
-- **The hybrid system's false-positive rate (2.84%) beats pushing the
-  model-only threshold down to the same recall (3.68%)** — this is the
-  correct comparison (same recall, different false-positive cost), not
-  "hybrid precision vs. model-only precision at the same threshold" (which
-  looks worse for the hybrid simply because it alerts on more volume).
+- **This retrain's honest surprise: at matched recall (0.919), the hybrid
+  system's false-positive rate (2.90%) is *worse* than the model alone
+  (1.46%), not better.** The model-only comparison sweeps every possible
+  threshold to find the cheapest way to reach that recall; the hybrid
+  number is rules-OR-model at the threshold actually deployed, and here
+  the rules add alerts (they're the low-precision 0.082 layer from the
+  table above) without adding recall the model didn't already have on its
+  own at that operating point — so this retrain, ORing them in is pure
+  false-positive cost, not a net win. That's a real result, not the one an
+  earlier run of this same pipeline produced (which found the opposite),
+  and the honest takeaway is that whether rules-alongside-a-model help or
+  hurt precision at a given recall depends on how much incremental recall
+  they're actually contributing that day — worth checking per retrain, not
+  something to assume permanently holds in either direction. The reason to
+  keep rules at all is unchanged: zero-latency, fully explainable coverage
+  that keeps working when the model is down or retraining, independent of
+  whether they help or hurt the blended precision number this week.
 - **These are demo-scale numbers, not bank-scale ones.** The holdout spans
-  5.2 days at ~9,231 txns/day; the build plan's own worked example assumes
+  5.2 days at ~9,036 txns/day; the build plan's own worked example assumes
   4M txns/day. The *mechanism* — calibrate to review capacity, don't pick
   F1-optimal — is what transfers, not the literal alert-rate percentage.
 
@@ -894,6 +959,79 @@ is what "exactly-once" means in most real streaming systems that claim
 it, and being able to say which piece provides which guarantee -- rather
 than "we use checkpoints so it's exactly-once" -- is the difference the
 build plan is pointing at.
+
+## What breaks at 100x, and what I'd change
+
+The build plan asks this explicitly, and it deserves an answer grounded in
+what this session actually measured, not a generic "add more servers."
+Nothing here was tested at 100x (that would be ~2,000-3,000 tx/s on top of
+the ~20-300 tx/s range this project measured) -- these are the specific
+bottlenecks this pipeline's own load tests exposed, extrapolated honestly
+rather than a fresh list of textbook scaling advice:
+
+- **The single biggest lever is the one Phase 5 already measured: stop
+  recomputing the feature stream three times in one Spark driver.**
+  Bronze, the Redis write, and the alert-scoring path are three
+  co-located streaming queries sharing `local[2]`'s two cores and one
+  JVM's Python-UDF overhead -- that's the actual reason three consumers
+  cost 15-40x instead of 3x, and it's also the first thing to fix, since
+  it's an architecture cost this deployment is paying for free, not a
+  law of streaming systems. Splitting them into independently-scaled
+  Spark applications (or at minimum separate executor pools) turns "three
+  consumers reading the same topic" back into roughly three times the
+  cost of one, not fifteen.
+- **Six Kafka partitions on `raw.transactions`, one broker, no
+  replication.** Partition count caps how much of the above fix actually
+  parallelizes -- more consumer parallelism than 6 partitions is wasted.
+  A single-broker KRaft cluster (this project's whole point was proving
+  streaming *semantics*, not running HA infrastructure) also means a lost
+  broker is data loss, not a processing pause, at any volume. Both need
+  fixing before 100x, not after: repartition `raw.transactions` to
+  something like 24-48, and run a 3-broker cluster with
+  `replication.factor=3`.
+- **Redis is a single instance.** The Phase 5 drill proved the pipeline
+  *degrades* correctly when it's unreachable (an important property to
+  keep), but at 100x volume a single Redis process is also a throughput
+  ceiling on its own, not just an availability risk. Redis Cluster or at
+  minimum a replica for read failover is the fix; the existing
+  degrade-don't-crash behavior in `redis_writer.py` stays exactly as it
+  is either way.
+- **Delta bronze isn't configured for idempotent writes or compaction.**
+  The `txnAppId`/`txnVersion` gap documented above matters more at 100x,
+  where a checkpoint-then-crash race is proportionally more likely simply
+  because there are more micro-batches per hour. Separately, continuous
+  small per-batch commits at 100x the write rate will produce a small-file
+  problem Delta's `OPTIMIZE`/compaction exists specifically to solve --
+  this project never needed a compaction job because bronze never got
+  large enough for it to matter, but it would at 100x.
+- **The alert service does one Postgres insert per alert and one
+  in-process WebSocket broadcast.** That's fine at this project's alert
+  volume (a few thousand alerts total across all testing); at 100x traffic
+  with a proportionally higher alert rate, this becomes batched inserts
+  (or a queue in front of Postgres) and either sticky-session WebSocket
+  routing or a pub/sub fan-out (e.g. Redis pub/sub) if the alert service
+  itself needs to run as more than one instance -- untested here because
+  one instance was never a bottleneck at this project's volume.
+- **The generator itself is a single Python process.** After fixing its
+  rate-limiter bug (see above), it hits its target rate accurately, but
+  "accurately" tops out well short of the build plan's stated 3,000-5,000
+  tx/s achievable from a batched-produce `confluent-kafka` process --
+  this project's generator uses `confluent-kafka` but produces one record
+  at a time per the behavioural-pacing design, which is the right choice
+  for *realistic* traffic shape and the wrong one for *maximum* throughput.
+  A pure firehose at 100x would need either batched produces or multiple
+  producer processes partitioned by customer range, and that's a
+  deliberate trade-off this project made in favor of realistic data over
+  raw throughput, worth stating as a choice rather than a limitation
+  discovered by accident.
+- **State store growth was never stress-tested at a larger customer
+  population.** `mapGroupsWithState` has a configured processing-time
+  timeout, so inactive customers do get evicted, but this project's
+  largest run used 2,000-5,000 synthetic customers -- confirming the TTL
+  actually bounds RocksDB state size at, say, 500,000 active customers is
+  a real gap between "the mechanism is correct" and "the mechanism was
+  measured at scale," and the honest answer is this project has only
+  verified the former.
 
 ## Common mistakes
 

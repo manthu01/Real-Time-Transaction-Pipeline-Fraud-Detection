@@ -1,43 +1,75 @@
 {
   "dataset": {
-    "total_transactions": 192073,
-    "fraud_count": 447,
-    "fraud_rate": 0.0023272401638960187,
-    "train_size": 144054,
-    "holdout_size": 48019,
-    "holdout_span_days": 5.202209841574074,
-    "holdout_txns_per_day": 9230.500395476263
+    "total_transactions": 187959,
+    "fraud_count": 333,
+    "fraud_rate": 0.0017716629690517614,
+    "train_size": 140969,
+    "holdout_size": 46990,
+    "holdout_span_days": 5.2003110449189816,
+    "holdout_txns_per_day": 9035.997961297348
   },
   "isolation_forest": {
-    "pr_auc": 0.3777857346568373
+    "pr_auc": 0.4572624882700835
   },
   "lightgbm": {
-    "pr_auc": 0.9361791554802478,
+    "pr_auc": 0.8637627430927446,
     "best_iteration": 1
   },
   "rules_only": {
-    "alert_rate": 0.014036110706178804,
-    "precision": 0.09198813056379822,
-    "recall": 0.7469879518072289
+    "alert_rate": 0.013279421153436902,
+    "precision": 0.08173076923076923,
+    "recall": 0.8225806451612904
   },
   "threshold_selection": {
     "target_alerts_per_day": 200.0,
-    "target_alert_rate": 0.021667297701218575,
-    "threshold": 0.5412477031788604,
-    "actual_alert_rate": 0.02167891876132364
+    "target_alert_rate": 0.0221336924661374,
+    "threshold": 0.5403141914851908,
+    "actual_alert_rate": 0.02215364971270483
   },
   "model_only_at_threshold": {
-    "precision": 0.0643611911623439,
-    "recall": 0.8072289156626506
+    "precision": 0.05475504322766571,
+    "recall": 0.9193548387096774
   },
   "hybrid_at_threshold": {
-    "precision": 0.04758572428271519,
-    "recall": 0.8192771084337349,
-    "alert_rate": 0.029759053707907285
+    "precision": 0.04022582921665491,
+    "recall": 0.9193548387096774,
+    "alert_rate": 0.030155352202596297
   },
   "false_positive_rate_at_matched_recall": {
-    "matched_recall": 0.8192771084337349,
-    "model_only_fpr": 0.036799065420560745,
-    "hybrid_fpr": 0.02839202269692924
+    "matched_recall": 0.9193548387096774,
+    "model_only_fpr": 0.014554210705762018,
+    "hybrid_fpr": 0.028980565973406067
+  },
+  "detection_rate_per_pattern": {
+    "ACCOUNT_TAKEOVER": {
+      "holdout_count": 2,
+      "hybrid_recall": 1.0,
+      "rules_only_recall": 1.0
+    },
+    "CARD_TESTING": {
+      "holdout_count": 31,
+      "hybrid_recall": 1.0,
+      "rules_only_recall": 0.9354838709677419
+    },
+    "GEO_IMPOSSIBLE_TRAVEL": {
+      "holdout_count": 4,
+      "hybrid_recall": 0.5,
+      "rules_only_recall": 0.5
+    },
+    "MERCHANT_CATEGORY_ANOMALY": {
+      "holdout_count": 2,
+      "hybrid_recall": 1.0,
+      "rules_only_recall": 1.0
+    },
+    "MULE_ACCOUNT": {
+      "holdout_count": 16,
+      "hybrid_recall": 1.0,
+      "rules_only_recall": 0.875
+    },
+    "SALAMI_SLICING": {
+      "holdout_count": 7,
+      "hybrid_recall": 0.5714285714285714,
+      "rules_only_recall": 0.2857142857142857
+    }
   }
 }
