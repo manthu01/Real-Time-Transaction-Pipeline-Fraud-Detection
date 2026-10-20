@@ -70,7 +70,19 @@ OUTPUT_COLUMN_NAMES = [f.name for f in OUTPUT_SCHEMA.fields]
 
 STATE_SCHEMA = StructType([StructField("state_json", StringType())])
 
+# per-alert TreeSHAP attribution from the LightGBM champion; "direction"
+# is "up" when the feature pushed the log-odds toward fraud
 TOP_FEATURE_STRUCT = StructType(
+    [
+        StructField("name", StringType()),
+        StructField("value", DoubleType()),
+        StructField("shap", DoubleType()),
+        StructField("direction", StringType()),
+    ]
+)
+
+# z-score against the non-fraud training population ("what's statistically odd")
+UNUSUAL_FEATURE_STRUCT = StructType(
     [
         StructField("name", StringType()),
         StructField("value", DoubleType()),
@@ -88,6 +100,9 @@ ALERT_SCHEMA = StructType(
         StructField("severity", StringType()),
         StructField("triggeredRules", ArrayType(StringType())),
         StructField("topFeatures", ArrayType(TOP_FEATURE_STRUCT)),
+        StructField("baseValue", DoubleType()),
+        StructField("isoScore", DoubleType()),
+        StructField("unusualFeatures", ArrayType(UNUSUAL_FEATURE_STRUCT)),
         StructField("trailingMean", DoubleType()),
         StructField("trailingMax", DoubleType()),
         StructField("amount", DoubleType()),

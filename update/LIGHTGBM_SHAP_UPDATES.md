@@ -174,3 +174,142 @@ budget would buy.
   harmless, left alone.
 
 Tests: detection 36 passed, analytics 24 passed.
+
+---
+
+## Phase 2 — Live scoring (`score.py`, `alert_scoring.py`)
+
+### What changed
+
+**`detection/pulseguard_detection/score.py`** (rewritten around a batch scorer)
+- `DetectionArtifacts` gains `lgbm_model` (a `lightgbm.Booster` loaded from
+  `lightgbm.txt`) and `iso_threshold`. `load_artifacts` refuses to start if
+  the booster's feature order doesn't match `feature_names.json`, because a
+  mismatched column order would quietly produce wrong scores.
+- New `score_batch(artifacts, feature_rows, raws)`: one `predict` call for
+  probabilities over the whole batch. Then **only for rows that alert**, one
+  `predict(pred_contrib=True)` call (TreeSHAP) and one Isolation Forest call.
+  Most transactions never alert, and SHAP is the expensive step.
+- `score_transaction` is now a one-row `score_batch`, so offline callers run
+  exactly the same code path as the streaming job.
+- Alert decision: `rules fired OR p >= threshold`, where `p` is LightGBM's
+  probability. The Isolation Forest is shadow-only.
+- Alert payload:
+  - `score`: LightGBM p (6 decimal places, because the threshold is ~3e-5)
+  - `topFeatures`: top 5 by |SHAP|, each `{name, value, shap, direction}`;
+    `direction: "up"` = pushed toward fraud
+  - `baseValue`: the SHAP bias term (log-odds)
+  - `isoScore`: Isolation Forest shadow score
+  - `unusualFeatures`: top 3 z-score features (the old explanation, kept
+    as `zscore_features()`)
+- `feature_matrix()` builds float64 rows with **NaN for missing values**
+  (None or NaN both become NaN), matching how LightGBM was trained in Phase 1.
+  The Isolation Forest still gets zeros because sklearn rejects NaN.
+- `severity_for(fired_rules, probability)`: rule severity logic unchanged.
+  Model-only alerts are HIGH when `p >= 0.5`, otherwise MEDIUM (see problem 1).
+
+**`streaming/pulseguard_streaming/alert_scoring.py`**: `score_partitions`
+hands each pandas batch to `score_batch` in a single call instead of looping
+rows through `score_transaction`.
+
+**`streaming/pulseguard_streaming/output_schema.py`**: `TOP_FEATURE_STRUCT`
+is now `{name, value, shap, direction}`. New `UNUSUAL_FEATURE_STRUCT`
+`{name, value, zScore}`. `ALERT_SCHEMA` gains `baseValue`, `isoScore` and
+`unusualFeatures`.
+
+**`streaming/Dockerfile`**: adds `lightgbm==4.7.0`, plus a build-time
+`import lightgbm` check. **`detection/requirements.txt`**: `lightgbm` pinned
+`==4.7.0` (was `>=4.5`) so the version that trains matches the version that
+serves, the same policy already used for scikit-learn.
+
+**`detection/tests/test_score.py`** (rewritten, 12 tests)
+- **SHAP additivity**: base + Σ SHAP == raw margin (log-odds), and
+  sigmoid(margin) == p, on a real LightGBM model trained in the test fixture.
+- **NaN test**: `secondsSincePrevTxn = NaN` (and `None`) reaches the
+  booster as NaN, not 0.0. Neither the decision path nor the explanation
+  path crashes, and a NaN value serialises as `null`. The fixture's model
+  treats first transactions as safe and fast ones as fraud, so the test
+  also asserts `p(NaN) < 0.5 < p(0.0)`. That proves 0.0 would have been
+  the wrong value, not just a different one.
+- **Rules-only alert** still fires when p is far below the threshold.
+- Batch scoring returns exactly the same results as row-by-row scoring.
+- SHAP ranking, sign/direction, top-5 cap, bias column excluded.
+- z-score ranking (old test kept), severity by probability.
+- The fake Isolation Forest now rejects NaN the way sklearn does, so a NaN
+  leaking into the shadow scorer fails a test instead of passing silently.
+
+### Problems hit and how they were fixed
+
+**1. `severity_for` stopped working once the threshold changed.**
+The old rule was HIGH if `score >= 1.5 × threshold`. That made sense for
+Isolation Forest scores around 0.54, but the LightGBM capacity threshold is
+3.3e-5, so almost every model-only alert would have been HIGH. **Fix:**
+model-only severity now uses the probability itself (HIGH at `p >= 0.5`).
+That's only meaningful because Phase 1 removed `scale_pos_weight`, so p is
+an actual probability again.
+
+**2. Tiny SHAP values were labelled with a direction but displayed as 0.0.**
+The new test caught it: a contribution like +0.00003 rounded to `shap: 0.0`
+but still showed `direction: "up"`. **Fix:** contributions that round to
+zero at 4 decimal places are dropped. They'd show up as zero-width bars in
+the waterfall anyway.
+
+**3. Model-only alerts all showed `score: 0.0`.** With a ~3e-5 threshold,
+rounding p to 4 places would have shown 0.0 for every model-only alert near
+it. **Fix:** 6 decimal places.
+
+**4. The arm64 image failed to build under emulation.** The first Dockerfile
+version ran `apt-get install libgomp1` (LightGBM's OpenMP runtime). On
+arm64 under QEMU, that pulled in a `libc-bin` upgrade whose `ldconfig`
+post-install step segfaulted (exit 139). It's a known QEMU problem: even a
+plain `ldconfig -p` crashes under emulation, so it isn't an ARM problem as
+such. Checked both base images: `libgomp1` 12.1.0 is **already installed**
+on amd64 and arm64. **Fix:** dropped the apt step and added a build-time
+`python3 -c "import lightgbm"` so a missing native library fails the build
+instead of the first live micro-batch.
+
+### Verification
+
+**Wheels:** `lightgbm==4.7.0` publishes `manylinux_2_28_x86_64` and
+`manylinux2014_aarch64` wheels. The base image `apache/spark-py:v3.4.0` is
+Ubuntu 22.04 (glibc 2.35, Python 3.10.6) and is published for amd64 and
+arm64.
+
+**Image builds**, both architectures built and scored the same transaction
+inside the container against the real artifacts:
+
+| Arch | Build | `import lightgbm` | p | baseValue | top SHAP |
+|---|---|---|---|---|---|
+| x86_64 (native) | ok | 4.7.0 | 1.0 | -10.4243 | txnCount1Min +28.34 |
+| aarch64 (QEMU) | ok | 4.7.0 | 1.0 | -10.4243 | txnCount1Min +28.34 |
+
+**Real artifacts on the full holdout (46,990 txns), through the actual
+`score_partitions` adapter in 500-row batches, without Spark:**
+- Alert rate **3.524%**, which matches train.py's LightGBM hybrid alert rate
+  (3.524%) exactly, so live and offline scoring agree.
+- Fraud caught **60 / 62** (recall 0.968, same as Phase 1).
+- SHAP additivity over every holdout row: max |base + Σ SHAP − margin| =
+  **3.2e-14**.
+- 35 NaN cells in the holdout matrix scored without error.
+- Speed: **158 µs/txn** on the batch path vs **386 µs/txn** row-by-row
+  (~2.4x). What's left in the batch path is mostly per-row rule evaluation
+  and building the matrix in Python.
+- Severity mix: 1,111 MEDIUM, 534 HIGH, 11 CRITICAL.
+
+Sample alert (rule `AMOUNT_SPIKE` fired; p = 0.0007, below the 0.5 HIGH line):
+```
+score 0.000704  baseValue -10.4243  isoScore 0.5878
+SHAP: txnSum5Min +1.60 up, distanceFromPrevKm -0.97 down,
+      distanceFromModalCityKm +0.58 up, txnSum1Hour +0.53 up,
+      distinctDevices7Day +0.51 up
+z:    amountZScore 3.46, distinctDevices24Hour 2.95, distinctDevices7Day 2.89
+```
+
+Tests: detection 40 passed, streaming 21 passed, analytics 24 passed.
+
+### Known gap until Phase 3
+The Kafka alert message now carries `topFeatures` entries with `shap` /
+`direction` instead of `zScore`. The current alert service and console still
+expect `zScore` (`TopFeaturesBars` calls `f.zScore.toFixed`), so **don't
+rebuild the live stack between this commit and Phase 3**. Phase 3 adds the
+new shape and keeps old `zScore` alerts readable.

@@ -8,7 +8,9 @@
 # and it's not something to find out about by reading a warning that
 # happens to look benign.
 scikit-learn==1.5.2
-lightgbm>=4.5
+# pinned exactly for the same reason: the Spark image loads lightgbm.txt
+# with this version (streaming/Dockerfile).
+lightgbm==4.7.0
 pandas>=2.2
 numpy>=2.0
 joblib>=1.4
