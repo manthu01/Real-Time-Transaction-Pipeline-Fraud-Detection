@@ -15,5 +15,9 @@ pandas>=2.2
 numpy>=2.0
 joblib>=1.4
 matplotlib>=3.9
+# offline only (explain_report.py) -- never installed in the Spark image,
+# which reads SHAP values from lightgbm itself. Pinned because the report
+# drives shap's dict-of-trees model format, an internal-ish API.
+shap==0.52.0
 -e ../common
 -e ../streaming

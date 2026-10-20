@@ -467,7 +467,7 @@ original rows and is now on the new schema version. Containers were stopped
 again.
 
 Builds: alert-service `tsc` and `nest build` OK; console `tsc` and
-`next build` OK. Tests: alert-service 31 passed (was 22), detection 42,
+`next build` OK. Tests: alert-service 31 passed (was 22), detection 41,
 streaming 21, analytics 24.
 
 ### Notes
@@ -478,3 +478,127 @@ streaming 21, analytics 24.
 - The waterfall's axis fits the data range, so on a low-p alert (axis −10.7
   to −7.0) small pushes look large. The caption always prints the axis
   range, so the scale is never hidden.
+
+---
+
+## Phase 4 — Offline SHAP report (`detection/`)
+
+### What changed
+
+**New `detection/pulseguard_detection/explain_report.py`**
+(`python -m pulseguard_detection.explain_report --input-jsonl data/training_raw.jsonl`)
+- Rebuilds the holdout with the **same time split** as `train.py`, so it's
+  exactly the data the metrics come from and the model never trained on.
+- **Cross-check:** compares SHAP values from an *independent* TreeSHAP
+  implementation against LightGBM's `pred_contrib` (what the live scorer
+  ships) over every holdout row, per feature and for the base value, plus
+  additivity for both. It exits non-zero if they differ by more than 1e-6.
+- Writes to `artifacts/`:
+  - `shap_importance.png`: mean |SHAP| for the top 15 features, on fraud
+    rows vs all holdout rows
+  - `shap_beeswarm.png`: all 62 holdout fraud rows plus 4,938 sampled
+    others
+  - `shap_report.json`: cross-check numbers, the full importance tables,
+    and the sample sizes
+
+**New `detection/tests/test_explain_report.py`** (3 tests): a small model
+trained so its splits use **both** LightGBM missing-value modes; independent
+TreeSHAP == `pred_contrib` within 1e-9 including NaN rows; and a
+non-circularity test (see problem 1).
+
+**`detection/requirements.txt`**: `shap==0.52.0`, offline only and never in
+the Spark image.
+
+**`README.md`**: the outdated "Explainability, mechanically" paragraph
+(which still described z-scores) is replaced with the SHAP version: how the
+live explanation works, how the report checks it, both plots, and what they
+show. Only that section was committed. The rest of the detection section
+is Phase 5's rewrite. The other uncommitted README edits already in the
+working tree were left unstaged.
+
+### Problems hit and how they were fixed
+
+**1. The first cross-check was circular, and it "passed" with a perfect 0.0.**
+The first version did the obvious thing: `shap.TreeExplainer(booster)` vs
+`booster.predict(pred_contrib=True)`. The difference was **exactly 0.0** on
+all 46,990 rows. Two separate float64 TreeSHAP implementations don't agree
+to the last bit, so that was a reason to look closer. Reading shap 0.52's
+source: for LightGBM models, `TreeExplainer.shap_values` **calls
+`booster.predict(..., pred_contrib=True)` itself**. It was checking LightGBM
+against LightGBM.
+
+**Fix:** pass shap a model *dictionary* instead of the `Booster`. Then shap
+runs its own C++ TreeSHAP and never calls LightGBM. `booster_as_shap_model()`
+parses `booster.dump_model()` into shap's generic tree format (flat
+children/feature/threshold/value/sample-weight arrays per tree).
+
+The tricky part is **missing values**. shap sends NaN to a node's
+`children_default`; LightGBM decides per split by `missing_type`:
+- `NaN`: NaN follows the learned `default_left`
+- `None`: that split never saw a missing value in training, so LightGBM
+  turns NaN into 0.0 and compares. The default is wherever 0.0 goes.
+- `Zero` (0.0 *and* NaN both count as missing): has no equivalent in
+  shap's format, so the converter **refuses** it rather than translating it
+  wrong. (This model has no such splits.)
+
+Categorical splits are refused the same way. Proof the new check is
+independent: `test_check_is_not_circular` changes one leaf value in the
+parsed trees and asserts the comparison then **fails**. If the values still
+came from LightGBM, editing the parsed trees couldn't change them.
+
+Result on the real model: max difference **7.1e-15**. That's float rounding
+between two genuinely different implementations, not an identical-code 0.0.
+
+**2. A plain random sample would have made the beeswarm useless.** At 0.13%
+fraud, a 5,000-row random sample has ~7 fraud dots. **Fix:** the beeswarm
+uses every holdout fraud row (62) plus a random sample of the rest, and
+says so in its title. Importances are always computed on every row.
+
+### Results
+
+Cross-check, all 46,990 holdout rows (35 with missing values):
+
+| Check | Max abs error |
+|---|---|
+| independent TreeSHAP vs `pred_contrib`, per-feature SHAP | **7.1e-15** |
+| ... base value | 0.0 |
+| additivity, `pred_contrib` (base + Σ SHAP vs margin) | 3.2e-14 |
+| additivity, independent TreeSHAP | 2.5e-14 |
+
+Base value: −10.4243 log-odds. Note this is the model's *average log-odds
+output* over the training data, not the log-odds of the fraud rate (0.18% ≈
+−6.3). Averaging in log-odds space is dominated by the ~99.8% of
+transactions the model is very sure are normal, so it sits far below
+logit(mean p). That's why the waterfall starts so far left: e.g. sigmoid(−10.42)
+≈ 3e-5, not 0.18%.
+
+Top features by mean |SHAP| on **fraud rows** (vs all rows):
+
+| Feature | Fraud rows | All rows |
+|---|---|---|
+| txnCount1Min | 13.18 | 0.041 |
+| distanceFromPrevKm | 5.23 | 0.029 |
+| secondsSincePrevTxn | 4.01 | 0.035 |
+| txnSum5Min | 3.76 | 0.050 |
+| maxTxnsInAny60SecWindowToday | 1.03 | 0.016 |
+| amountToTrailingMaxRatio | 0.96 | 0.056 |
+| amountZScore | 0.44 | 0.017 |
+| txnSum1Hour | 0.32 | 0.011 |
+
+### What the plots revealed (written into the README)
+- The model is mostly about **burst velocity** (`txnCount1Min`,
+  `secondsSincePrevTxn`, `txnSum5Min`): card testing and mule fan-in, which
+  are 47 of the 62 holdout fraud rows.
+- **Low `distanceFromPrevKm` pushes hard toward fraud** (up to +12
+  log-odds). Being where you last transacted isn't a fraud signal by itself;
+  the model has learned that the generator fires card-testing bursts from a
+  single location. This is the Phase 1 leakage caveat made visible: part of
+  the 0.906 PR-AUC is the model learning the simulator's fingerprints. It's
+  also exactly the kind of explanation a real analyst would challenge, which
+  is an argument for shipping SHAP to the console.
+- Geo features barely register, which fits there being 4 impossible-travel
+  and 2 merchant-anomaly fraud rows in the holdout. The rules still carry
+  those patterns.
+
+Tests: detection 44 passed (41 + 3 new). Report runtime ~4 min, nearly all
+of it rebuilding the 188k-row feature dataset.

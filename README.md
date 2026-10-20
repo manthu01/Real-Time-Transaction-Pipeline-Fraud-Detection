@@ -565,16 +565,56 @@ them stand alone:
   4M txns/day. The *mechanism* — calibrate to review capacity, don't pick
   F1-optimal — is what transfers, not the literal alert-rate percentage.
 
-**Explainability, mechanically.** `score.py`'s `top_contributing_features`
-ranks each feature by how many standard deviations it sits from the
-non-fraud training population's mean (`feature_stats.json`) — a
-deliberately simple signal, not a SHAP value, chosen so the live scoring
-path (`alert_scoring.py`, wired into `feature_job.py` via `mapInPandas`)
-has no extra heavy dependency. Every alert written to `fraud.alerts`
-carries `triggeredRules`, a `severity` (the highest severity among fired
-rules, or scaled from how far the anomaly score cleared the threshold if
-no rule fired), and the top 3 unusual features — the build plan's point
-that "an alert without an explanation is an alert an analyst can't act on."
+**Explainability, mechanically.** Every alert carries an exact per-alert
+SHAP explanation from the LightGBM champion: `score.py` reads TreeSHAP
+values straight out of LightGBM (`predict(..., pred_contrib=True)`), one
+log-odds contribution per feature plus a base value, and ships the top 5 by
+|SHAP| as `topFeatures` (`{name, value, shap, direction}`) alongside
+`baseValue` and `rawScore`. Base value + every feature's SHAP value equals
+the model's raw output exactly (asserted in `test_score.py`, and to 3e-14 on
+every holdout row), which is what lets the console draw a waterfall that
+adds up. Reading the values out of LightGBM rather than importing `shap`
+keeps the Spark image free of shap's dependency tree. The older z-score
+signal ("how many standard deviations from the non-fraud population") is
+still there as `unusualFeatures`, because "why did the model flag it" and
+"what's statistically odd about it" are different questions an analyst asks.
+
+**Checking that those really are SHAP values.**
+`python -m pulseguard_detection.explain_report --input-jsonl data/training_raw.jsonl`
+recomputes them on the whole holdout set (46,990 rows, including the 35 with
+missing values) with an independent implementation and refuses to finish if
+the two disagree beyond 1e-6. Measured: max difference **7.1e-15**.
+"Independent" took a second attempt. Handed a LightGBM `Booster`,
+`shap.TreeExplainer` doesn't run its own algorithm at all; it calls
+`booster.predict(pred_contrib=True)`, the function being checked. The first
+version of the report "matched" with a difference of exactly 0.0, which is
+what gave that away. The report now parses the trees out of
+`booster.dump_model()` into shap's generic tree format and runs shap's own
+C++ TreeSHAP on that, translating LightGBM's per-split missing-value routing
+(`missing_type` NaN vs None) into shap's default-child convention.
+`test_explain_report.py` checks both NaN modes, and also proves the check
+isn't circular: changing one parsed leaf value must make it fail.
+
+![LightGBM global SHAP importance](detection/artifacts/shap_importance.png)
+
+![LightGBM SHAP beeswarm](detection/artifacts/shap_beeswarm.png)
+
+What the plots say, including the uncomfortable part:
+- The model leans on **burst velocity**: `txnCount1Min` (mean |SHAP| 13.2
+  log-odds on fraud rows), `secondsSincePrevTxn` and `txnSum5Min`. That's
+  card testing and mule fan-in, the two biggest injected patterns (31 + 16
+  of the 62 holdout fraud rows).
+- **Low** `distanceFromPrevKm` pushes hard *toward* fraud (blue dots out to
+  +12 on the beeswarm). Being in the same place as your last transaction
+  isn't a fraud signal in itself. The model has learned that the generator
+  fires card-testing bursts from one location. That's SHAP exposing the
+  leakage caveat above in concrete terms: part of LightGBM's 0.906 PR-AUC
+  is it learning the simulator's fingerprints, and this is exactly the
+  explanation a real analyst would push back on.
+- Geo features (`impliedSpeedKmh`, `distanceFromModalCityKm`) barely
+  register, which fits there being only 4 impossible-travel and 2
+  merchant-anomaly fraud rows in the holdout to learn from. Rules still
+  carry those patterns.
 
 **A real bug this caught: NaN vs. None.** The first live run of the wired-in
 scoring stage crashed every micro-batch with `ValueError: Input X contains
