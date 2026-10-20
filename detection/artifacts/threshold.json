@@ -1,6 +1,9 @@
 {
+  "model": "lightgbm",
+  "threshold": 3.301448208371191e-05,
+  "iso_threshold": 0.5403141914851908,
   "target_alerts_per_day": 200.0,
   "target_alert_rate": 0.0221336924661374,
-  "threshold": 0.5403141914851908,
-  "actual_alert_rate": 0.02215364971270483
+  "actual_alert_rate": 0.025601191742924027,
+  "iso_actual_alert_rate": 0.02215364971270483
 }

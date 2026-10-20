@@ -8,12 +8,13 @@
     "holdout_span_days": 5.2003110449189816,
     "holdout_txns_per_day": 9035.997961297348
   },
+  "champion_model": "lightgbm",
   "isolation_forest": {
     "pr_auc": 0.4572624882700835
   },
   "lightgbm": {
-    "pr_auc": 0.8637627430927446,
-    "best_iteration": 1
+    "pr_auc": 0.9057187123054957,
+    "best_iteration": 83
   },
   "rules_only": {
     "alert_rate": 0.013279421153436902,
@@ -21,55 +22,95 @@
     "recall": 0.8225806451612904
   },
   "threshold_selection": {
-    "target_alerts_per_day": 200.0,
-    "target_alert_rate": 0.0221336924661374,
-    "threshold": 0.5403141914851908,
-    "actual_alert_rate": 0.02215364971270483
+    "lightgbm": {
+      "target_alerts_per_day": 200.0,
+      "target_alert_rate": 0.0221336924661374,
+      "threshold": 3.301448208371191e-05,
+      "actual_alert_rate": 0.025601191742924027
+    },
+    "isolation_forest": {
+      "target_alerts_per_day": 200.0,
+      "target_alert_rate": 0.0221336924661374,
+      "threshold": 0.5403141914851908,
+      "actual_alert_rate": 0.02215364971270483
+    }
   },
-  "model_only_at_threshold": {
-    "precision": 0.05475504322766571,
-    "recall": 0.9193548387096774
-  },
-  "hybrid_at_threshold": {
-    "precision": 0.04022582921665491,
-    "recall": 0.9193548387096774,
-    "alert_rate": 0.030155352202596297
+  "at_capacity_threshold": {
+    "isolation_forest_only": {
+      "precision": 0.05475504322766571,
+      "recall": 0.9193548387096774,
+      "alert_rate": 0.02215364971270483
+    },
+    "isolation_forest_hybrid": {
+      "precision": 0.04022582921665491,
+      "recall": 0.9193548387096774,
+      "alert_rate": 0.030155352202596297
+    },
+    "lightgbm_only": {
+      "precision": 0.04987531172069826,
+      "recall": 0.967741935483871,
+      "alert_rate": 0.025601191742924027
+    },
+    "lightgbm_hybrid": {
+      "precision": 0.036231884057971016,
+      "recall": 0.967741935483871,
+      "alert_rate": 0.03524154075335178
+    }
   },
   "false_positive_rate_at_matched_recall": {
-    "matched_recall": 0.9193548387096774,
-    "model_only_fpr": 0.014554210705762018,
-    "hybrid_fpr": 0.028980565973406067
+    "lightgbm": {
+      "matched_recall": 0.967741935483871,
+      "model_only_fpr": 0.011954483464030004,
+      "hybrid_fpr": 0.03400954653937947
+    },
+    "isolation_forest": {
+      "matched_recall": 0.9193548387096774,
+      "model_only_fpr": 0.014554210705762018,
+      "hybrid_fpr": 0.028980565973406067
+    }
   },
   "detection_rate_per_pattern": {
     "ACCOUNT_TAKEOVER": {
       "holdout_count": 2,
-      "hybrid_recall": 1.0,
-      "rules_only_recall": 1.0
+      "rules_only_recall": 1.0,
+      "isolation_forest_hybrid_recall": 1.0,
+      "lightgbm_only_recall": 1.0,
+      "lightgbm_hybrid_recall": 1.0
     },
     "CARD_TESTING": {
       "holdout_count": 31,
-      "hybrid_recall": 1.0,
-      "rules_only_recall": 0.9354838709677419
+      "rules_only_recall": 0.9354838709677419,
+      "isolation_forest_hybrid_recall": 1.0,
+      "lightgbm_only_recall": 1.0,
+      "lightgbm_hybrid_recall": 1.0
     },
     "GEO_IMPOSSIBLE_TRAVEL": {
       "holdout_count": 4,
-      "hybrid_recall": 0.5,
-      "rules_only_recall": 0.5
+      "rules_only_recall": 0.5,
+      "isolation_forest_hybrid_recall": 0.5,
+      "lightgbm_only_recall": 1.0,
+      "lightgbm_hybrid_recall": 1.0
     },
     "MERCHANT_CATEGORY_ANOMALY": {
       "holdout_count": 2,
-      "hybrid_recall": 1.0,
-      "rules_only_recall": 1.0
+      "rules_only_recall": 1.0,
+      "isolation_forest_hybrid_recall": 1.0,
+      "lightgbm_only_recall": 1.0,
+      "lightgbm_hybrid_recall": 1.0
     },
     "MULE_ACCOUNT": {
       "holdout_count": 16,
-      "hybrid_recall": 1.0,
-      "rules_only_recall": 0.875
+      "rules_only_recall": 0.875,
+      "isolation_forest_hybrid_recall": 1.0,
+      "lightgbm_only_recall": 1.0,
+      "lightgbm_hybrid_recall": 1.0
     },
     "SALAMI_SLICING": {
       "holdout_count": 7,
-      "hybrid_recall": 0.5714285714285714,
-      "rules_only_recall": 0.2857142857142857
+      "rules_only_recall": 0.2857142857142857,
+      "isolation_forest_hybrid_recall": 0.5714285714285714,
+      "lightgbm_only_recall": 0.7142857142857143,
+      "lightgbm_hybrid_recall": 0.7142857142857143
     }
   }
 }

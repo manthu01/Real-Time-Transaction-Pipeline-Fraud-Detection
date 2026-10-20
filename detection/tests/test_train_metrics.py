@@ -1,6 +1,6 @@
 import numpy as np
 
-from pulseguard_detection.train import detection_rate_per_pattern, false_positive_rate_at_recall, time_split
+from pulseguard_detection.train import detection_rate_per_pattern, false_positive_rate_at_recall, operating_point, time_split
 import pandas as pd
 
 
@@ -40,8 +40,26 @@ def test_detection_rate_per_pattern_splits_recall_by_injected_pattern():
     hybrid_flagged = np.array([True, True, False, False, True])
     rules_fired = np.array([True, False, False, False, False])
 
-    result = detection_rate_per_pattern(holdout_df, hybrid_flagged, rules_fired)
+    result = detection_rate_per_pattern(holdout_df, {"hybrid": hybrid_flagged, "rules_only": rules_fired})
 
     assert result["CARD_TESTING"] == {"holdout_count": 2, "hybrid_recall": 1.0, "rules_only_recall": 0.5}
     assert result["MULE_ACCOUNT"] == {"holdout_count": 1, "hybrid_recall": 0.0, "rules_only_recall": 0.0}
     assert "None" not in result and None not in result
+
+
+def test_operating_point_hybrid_adds_rule_only_catches():
+    # model catches fraud row 3 only; rules catch fraud row 4 plus a false positive at row 0
+    scores = np.array([0.1, 0.2, 0.3, 0.9, 0.4])
+    labels = np.array([0, 0, 0, 1, 1])
+    rules_fired = np.array([True, False, False, False, True])
+
+    op = operating_point(scores, labels, rules_fired, threshold=0.5)
+
+    assert op["model_only"] == {"precision": 1.0, "recall": 0.5, "alert_rate": 0.2}
+    assert op["hybrid"]["recall"] == 1.0
+    assert op["hybrid"]["precision"] == 2 / 3
+    assert op["hybrid"]["alert_rate"] == 0.6
+    # the two fraud rows are also the two highest scores, so the model alone
+    # reaches the hybrid's recall with zero false positives
+    assert op["false_positive_rate_at_matched_recall"]["model_only_fpr"] == 0.0
+    assert op["false_positive_rate_at_matched_recall"]["hybrid_fpr"] == 1 / 3

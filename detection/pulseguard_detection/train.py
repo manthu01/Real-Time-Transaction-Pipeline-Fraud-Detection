@@ -10,16 +10,19 @@ Pipeline:
      (unsupervised -- realistic, since production fraud labels are rarely
      clean at scale).
   3. Train a LightGBM classifier on the full TRAIN set with class-weight
-     correction, as a supervised benchmark to quantify what's given up by
-     going unsupervised.
+     correction. LightGBM is the live champion (it drives alerts); the
+     Isolation Forest scores in shadow alongside it, because it needs no
+     labels and so is the one that can still notice a fraud pattern
+     nobody has labelled yet.
   4. Evaluate both on the HOLDOUT set: precision/recall/PR-AUC, never
      accuracy (meaningless at <1% prevalence).
   5. Evaluate the rule engine on the same holdout.
   6. Pick an alert threshold from analyst review capacity, not from an
-     F1-optimal cutoff, and report the false-positive-rate difference
-     between the model alone and the rules+model hybrid at equal recall.
-  7. Save both models, the threshold, the trade-off curve (as CSV and a
-     PNG chart), and metrics.json.
+     F1-optimal cutoff -- for each model separately -- and report
+     model-only vs rules+model hybrid precision/recall at that threshold,
+     plus the false-positive-rate difference at equal recall.
+  7. Save both models, both thresholds, the trade-off curves (as CSV and
+     a PNG chart), and metrics.json.
 """
 
 from __future__ import annotations
@@ -83,22 +86,36 @@ def train_lightgbm(train_df: pd.DataFrame, val_fraction: float = 0.15) -> lgb.LG
     This matters more than it looks: a fixed `n_estimators` tuned by eye
     against the holdout set's own PR-AUC would be a subtle form of
     leakage (the "holdout" stops being untouched the moment a
-    hyperparameter gets picked to make its score look good). Early
-    stopping on the validation PR-AUC found here that additional boosting
-    rounds past the first do not generalize on this dataset -- the
-    injected fraud patterns are extreme enough that a shallow model
-    already separates them, and further boosting mostly overfits the
-    ~300-object minority class. Reporting `best_iteration_` in the metrics
-    output is the honest way to surface that rather than hide it.
+    hyperparameter gets picked to make its score look good). Reporting
+    `best_iteration_` in the metrics output keeps that choice visible.
+
+    No class reweighting (scale_pos_weight). An earlier version set it to
+    n_neg/n_pos (~560 here), and early stopping then picked a single
+    boosting round: that first heavily-weighted tree already pushed its
+    fraud leaves to p~1.0, so the model emitted only ~7 distinct
+    probabilities. PR-AUC is rank-based, so the reweighting bought no
+    ranking quality (validation PR-AUC was ~0.98-0.99 either way), but it
+    broke two things the live path depends on: the capacity-based
+    threshold (a quantile over 7 values can only land on "alert on almost
+    nothing" or "alert on everything") and the meaning of p shown to
+    analysts. Unweighted, early stopping keeps ~80 rounds, scores are
+    continuous, and p stays a probability.
+
+    Missing values are passed through as NaN, NOT filled with 0.0 (unlike
+    the Isolation Forest, which can't take NaN at all). The main one is
+    secondsSincePrevTxn on a customer's first-ever transaction: 0.0 there
+    would claim "zero seconds since the previous transaction" -- the
+    signature of card testing -- for a transaction that has no previous
+    one. LightGBM learns a default direction for missing values at every
+    split, so NaN keeps "no history" distinct from "very fast". The live
+    scorer (score.py) passes NaN the same way; filling here but not there
+    would be training/serving skew.
     """
     import lightgbm as lgb
 
     inner_train, val = time_split(train_df, 1 - val_fraction)
-    X_tr, y_tr = feature_matrix(inner_train).fillna(0.0), inner_train["isFraud"].astype(int)
-    X_val, y_val = feature_matrix(val).fillna(0.0), val["isFraud"].astype(int)
-
-    n_pos, n_neg = y_tr.sum(), len(y_tr) - y_tr.sum()
-    scale_pos_weight = (n_neg / n_pos) if n_pos > 0 else 1.0
+    X_tr, y_tr = lightgbm_feature_matrix(inner_train), inner_train["isFraud"].astype(int)
+    X_val, y_val = lightgbm_feature_matrix(val), val["isFraud"].astype(int)
 
     model = lgb.LGBMClassifier(
         n_estimators=1000,
@@ -106,7 +123,6 @@ def train_lightgbm(train_df: pd.DataFrame, val_fraction: float = 0.15) -> lgb.LG
         num_leaves=31,
         min_child_samples=20,
         learning_rate=0.05,
-        scale_pos_weight=scale_pos_weight,
         random_state=42,
         verbosity=-1,
     )
@@ -120,9 +136,15 @@ def train_lightgbm(train_df: pd.DataFrame, val_fraction: float = 0.15) -> lgb.LG
     return model
 
 
+def lightgbm_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    """feature_matrix with nulls kept as NaN (see train_lightgbm) and the
+    boolean features as 0/1 floats -- the same float64 matrix the live
+    scorer hands the Booster."""
+    return feature_matrix(df).astype("float64")
+
+
 def lightgbm_scores(model: lgb.LGBMClassifier, df: pd.DataFrame) -> np.ndarray:
-    X = feature_matrix(df).fillna(0.0)
-    return model.predict_proba(X)[:, 1]
+    return model.predict_proba(lightgbm_feature_matrix(df))[:, 1]
 
 
 def rule_fired_flags(df: pd.DataFrame) -> np.ndarray:
@@ -147,26 +169,27 @@ def evaluate_rules_on_holdout(fired_any: np.ndarray, labels: np.ndarray) -> dict
     }
 
 
-def detection_rate_per_pattern(holdout_df: pd.DataFrame, hybrid_flagged: np.ndarray, rules_fired: np.ndarray) -> dict:
+def detection_rate_per_pattern(holdout_df: pd.DataFrame, flagged_by: dict[str, np.ndarray]) -> dict:
     """Recall broken down by which of the 6 injected fraud patterns each
     holdout fraud row actually is -- the build plan asks for this
     specifically because an aggregate recall number hides whether a
     detector is strong everywhere or only on the easy patterns. Restricted
-    to rows where isFraud is true, since fraudPattern is null otherwise."""
+    to rows where isFraud is true, since fraudPattern is null otherwise.
+
+    `flagged_by` maps a detector name (e.g. "rules_only", "lightgbm_hybrid")
+    to its per-row flags over holdout_df; each becomes a `<name>_recall`
+    entry, so every detector is compared on the same fraud rows."""
     fraud_rows = holdout_df[holdout_df["isFraud"]]
     fraud_idx = fraud_rows.index.to_numpy()
-    hybrid_hit = pd.Series(hybrid_flagged, index=holdout_df.index).loc[fraud_idx]
-    rules_hit = pd.Series(rules_fired, index=holdout_df.index).loc[fraud_idx]
+    hits = {name: pd.Series(flags, index=holdout_df.index).loc[fraud_idx] for name, flags in flagged_by.items()}
 
     result = {}
     for pattern, group in fraud_rows.groupby("fraudPattern"):
         idx = group.index
         n = len(idx)
-        result[pattern] = {
-            "holdout_count": int(n),
-            "hybrid_recall": float(hybrid_hit.loc[idx].sum() / n),
-            "rules_only_recall": float(rules_hit.loc[idx].sum() / n),
-        }
+        result[pattern] = {"holdout_count": int(n)}
+        for name, hit in hits.items():
+            result[pattern][f"{name}_recall"] = float(hit.loc[idx].sum() / n)
     return result
 
 
@@ -188,6 +211,35 @@ def false_positive_rate_at_recall(scores: np.ndarray, labels: np.ndarray, target
     fp = n_flagged - tp
     n_neg = len(labels) - n_pos
     return float(fp / n_neg) if n_neg > 0 else float("nan")
+
+
+def operating_point(scores: np.ndarray, labels: np.ndarray, rules_fired: np.ndarray, threshold: float) -> dict:
+    """Everything the review team would feel at one threshold: model-only
+    and hybrid (rules OR score >= threshold) precision/recall/alert rate,
+    plus the model-only false-positive rate at the hybrid's recall."""
+    is_fraud = labels.astype(bool)
+    model_flagged = scores >= threshold
+    hybrid_flagged = model_flagged | rules_fired
+    hybrid_recall = float((hybrid_flagged & is_fraud).sum() / max(is_fraud.sum(), 1))
+    return {
+        "model_flagged": model_flagged,
+        "hybrid_flagged": hybrid_flagged,
+        "model_only": {
+            "precision": float(precision_score(labels, model_flagged, zero_division=0)),
+            "recall": recall_at_threshold(scores, labels, threshold),
+            "alert_rate": float(model_flagged.mean()),
+        },
+        "hybrid": {
+            "precision": float(precision_score(labels, hybrid_flagged, zero_division=0)),
+            "recall": hybrid_recall,
+            "alert_rate": float(hybrid_flagged.mean()),
+        },
+        "false_positive_rate_at_matched_recall": {
+            "matched_recall": hybrid_recall,
+            "model_only_fpr": false_positive_rate_at_recall(scores, labels, hybrid_recall),
+            "hybrid_fpr": float((hybrid_flagged & ~is_fraud).sum() / max((~is_fraud).sum(), 1)),
+        },
+    }
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -214,7 +266,7 @@ def main(argv: list[str] | None = None) -> None:
     iso_model = train_isolation_forest(train_df)
     iso_scores_holdout = isolation_forest_scores(iso_model, holdout_df)
 
-    print("Training LightGBM (supervised benchmark, early-stopped on a validation split) ...")
+    print("Training LightGBM (champion, early-stopped on a validation split) ...")
     lgb_model = train_lightgbm(train_df)
     lgb_scores_holdout = lightgbm_scores(lgb_model, holdout_df)
     print(f"  early stopping selected {lgb_model.best_iteration_} boosting round(s)")
@@ -231,37 +283,50 @@ def main(argv: list[str] | None = None) -> None:
     rule_metrics = evaluate_rules_on_holdout(rules_fired, labels_holdout)
     print(f"  rules-only: precision={rule_metrics['precision']:.4f} recall={rule_metrics['recall']:.4f} alert_rate={rule_metrics['alert_rate']:.4%}")
 
-    print("Selecting alert threshold from analyst review capacity ...")
-    capacity = select_threshold_for_capacity(
-        iso_scores_holdout, txns_per_day, args.reviews_per_analyst_per_day, args.analyst_count
-    )
-    threshold = capacity["threshold"]
-    model_flagged = iso_scores_holdout >= threshold
-    model_recall = recall_at_threshold(iso_scores_holdout, labels_holdout, threshold)
-    model_precision = float(precision_score(labels_holdout, model_flagged, zero_division=0))
-    print(f"  target {capacity['target_alerts_per_day']:.0f} alerts/day -> alert_rate={capacity['actual_alert_rate']:.5%}, threshold={threshold:.4f}")
-    print(f"  model-only at this threshold: precision={model_precision:.4f} recall={model_recall:.4f}")
+    print("Selecting alert thresholds from analyst review capacity (per model) ...")
+    capacity_args = (txns_per_day, args.reviews_per_analyst_per_day, args.analyst_count)
+    capacities = {
+        "lightgbm": select_threshold_for_capacity(lgb_scores_holdout, *capacity_args),
+        "isolation_forest": select_threshold_for_capacity(iso_scores_holdout, *capacity_args),
+    }
+    holdout_scores = {"lightgbm": lgb_scores_holdout, "isolation_forest": iso_scores_holdout}
+    print(f"  target {capacities['lightgbm']['target_alerts_per_day']:.0f} alerts/day -> target alert_rate={capacities['lightgbm']['target_alert_rate']:.5%}")
 
-    hybrid_flagged = model_flagged | rules_fired
-    hybrid_recall = float((hybrid_flagged & labels_holdout.astype(bool)).sum() / max(labels_holdout.sum(), 1))
-    hybrid_precision = float(precision_score(labels_holdout, hybrid_flagged, zero_division=0))
-    hybrid_alert_rate = float(hybrid_flagged.mean())
-
-    model_only_fpr_at_hybrid_recall = false_positive_rate_at_recall(iso_scores_holdout, labels_holdout, hybrid_recall)
-    hybrid_fpr = float((hybrid_flagged & ~labels_holdout.astype(bool)).sum() / max((~labels_holdout.astype(bool)).sum(), 1))
-
-    print(f"  hybrid (rules OR model>=threshold): precision={hybrid_precision:.4f} recall={hybrid_recall:.4f} alert_rate={hybrid_alert_rate:.5%}")
-    print(f"  false positive rate at matched recall ({hybrid_recall:.4f}): model-only={model_only_fpr_at_hybrid_recall:.4%} hybrid={hybrid_fpr:.4%}")
+    operating_points = {}
+    for name, capacity in capacities.items():
+        op = operating_point(holdout_scores[name], labels_holdout, rules_fired, capacity["threshold"])
+        operating_points[name] = op
+        fpr = op["false_positive_rate_at_matched_recall"]
+        print(f"  {name}: threshold={capacity['threshold']:.4f} actual alert_rate={capacity['actual_alert_rate']:.5%}")
+        if capacity["actual_alert_rate"] > 2 * capacity["target_alert_rate"]:
+            # tied scores at the quantile (a model with few distinct outputs)
+            # make "score >= threshold" overshoot the capacity it was picked for
+            print(f"    WARNING: actual alert rate is over 2x the capacity target -- {name}'s scores are too tied for a capacity threshold")
+        print(f"    model-only: precision={op['model_only']['precision']:.4f} recall={op['model_only']['recall']:.4f}")
+        print(f"    hybrid (rules OR model>=threshold): precision={op['hybrid']['precision']:.4f} recall={op['hybrid']['recall']:.4f} alert_rate={op['hybrid']['alert_rate']:.5%}")
+        print(f"    false positive rate at matched recall ({fpr['matched_recall']:.4f}): model-only={fpr['model_only_fpr']:.4%} hybrid={fpr['hybrid_fpr']:.4%}")
 
     print("Breaking down detection rate per injected fraud pattern ...")
-    per_pattern = detection_rate_per_pattern(holdout_df, hybrid_flagged, rules_fired)
+    per_pattern = detection_rate_per_pattern(
+        holdout_df,
+        {
+            "rules_only": rules_fired,
+            "isolation_forest_hybrid": operating_points["isolation_forest"]["hybrid_flagged"],
+            "lightgbm_only": operating_points["lightgbm"]["model_flagged"],
+            "lightgbm_hybrid": operating_points["lightgbm"]["hybrid_flagged"],
+        },
+    )
     for pattern, stats in sorted(per_pattern.items()):
-        print(f"  {pattern}: n={stats['holdout_count']} hybrid_recall={stats['hybrid_recall']:.4f} rules_only_recall={stats['rules_only_recall']:.4f}")
+        recalls = " ".join(f"{k}={v:.4f}" for k, v in stats.items() if k != "holdout_count")
+        print(f"  {pattern}: n={stats['holdout_count']} {recalls}")
 
-    print("Building alerts/day vs fraud-caught trade-off curve ...")
-    curve = trade_off_curve(iso_scores_holdout, labels_holdout, txns_per_day)
-    curve.to_csv(artifacts_dir / "threshold_tradeoff.csv", index=False)
-    _plot_tradeoff_curve(curve, capacity, artifacts_dir / "threshold_tradeoff.png")
+    print("Building alerts/day vs fraud-caught trade-off curves ...")
+    curves = pd.concat(
+        [trade_off_curve(holdout_scores[name], labels_holdout, txns_per_day).assign(model=name) for name in capacities],
+        ignore_index=True,
+    )
+    curves.to_csv(artifacts_dir / "threshold_tradeoff.csv", index=False)
+    _plot_tradeoff_curve(curves, capacities["lightgbm"], artifacts_dir / "threshold_tradeoff.png")
 
     non_fraud_train = feature_matrix(train_df[~train_df["isFraud"]]).fillna(0.0)
     feature_stats = {
@@ -269,11 +334,23 @@ def main(argv: list[str] | None = None) -> None:
         for name in FEATURE_NAMES
     }
 
+    # what the live scorer reads: LightGBM's threshold drives alerts,
+    # iso_threshold is only used to put the shadow score in context.
+    threshold_doc = {
+        "model": "lightgbm",
+        "threshold": capacities["lightgbm"]["threshold"],
+        "iso_threshold": capacities["isolation_forest"]["threshold"],
+        "target_alerts_per_day": capacities["lightgbm"]["target_alerts_per_day"],
+        "target_alert_rate": capacities["lightgbm"]["target_alert_rate"],
+        "actual_alert_rate": capacities["lightgbm"]["actual_alert_rate"],
+        "iso_actual_alert_rate": capacities["isolation_forest"]["actual_alert_rate"],
+    }
+
     joblib.dump(iso_model, artifacts_dir / "isolation_forest.joblib")
     lgb_model.booster_.save_model(str(artifacts_dir / "lightgbm.txt"))
     (artifacts_dir / "feature_names.json").write_text(json.dumps(list(FEATURE_NAMES), indent=2))
     (artifacts_dir / "feature_stats.json").write_text(json.dumps(feature_stats, indent=2))
-    (artifacts_dir / "threshold.json").write_text(json.dumps(capacity, indent=2))
+    (artifacts_dir / "threshold.json").write_text(json.dumps(threshold_doc, indent=2))
 
     metrics = {
         "dataset": {
@@ -285,20 +362,19 @@ def main(argv: list[str] | None = None) -> None:
             "holdout_span_days": span_days,
             "holdout_txns_per_day": txns_per_day,
         },
+        "champion_model": "lightgbm",
         "isolation_forest": {"pr_auc": float(iso_pr_auc)},
         "lightgbm": {"pr_auc": float(lgb_pr_auc), "best_iteration": int(lgb_model.best_iteration_)},
         "rules_only": rule_metrics,
-        "threshold_selection": capacity,
-        "model_only_at_threshold": {"precision": model_precision, "recall": model_recall},
-        "hybrid_at_threshold": {
-            "precision": hybrid_precision,
-            "recall": hybrid_recall,
-            "alert_rate": hybrid_alert_rate,
+        "threshold_selection": capacities,
+        "at_capacity_threshold": {
+            "isolation_forest_only": operating_points["isolation_forest"]["model_only"],
+            "isolation_forest_hybrid": operating_points["isolation_forest"]["hybrid"],
+            "lightgbm_only": operating_points["lightgbm"]["model_only"],
+            "lightgbm_hybrid": operating_points["lightgbm"]["hybrid"],
         },
         "false_positive_rate_at_matched_recall": {
-            "matched_recall": hybrid_recall,
-            "model_only_fpr": model_only_fpr_at_hybrid_recall,
-            "hybrid_fpr": hybrid_fpr,
+            name: op["false_positive_rate_at_matched_recall"] for name, op in operating_points.items()
         },
         "detection_rate_per_pattern": per_pattern,
     }
@@ -306,14 +382,16 @@ def main(argv: list[str] | None = None) -> None:
     print(f"\nArtifacts written to {artifacts_dir}/")
 
 
-def _plot_tradeoff_curve(curve: pd.DataFrame, capacity: dict, out_path: Path) -> None:
+def _plot_tradeoff_curve(curves: pd.DataFrame, capacity: dict, out_path: Path) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    labels = {"lightgbm": "LightGBM (champion)", "isolation_forest": "Isolation Forest (shadow)"}
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(curve["alerts_per_day"], curve["recall"], marker="o", markersize=3, label="operating curve")
+    for model, curve in curves.groupby("model", sort=False):
+        ax.plot(curve["alerts_per_day"], curve["recall"], marker="o", markersize=3, label=labels.get(model, model))
     ax.axvline(capacity["target_alerts_per_day"], color="red", linestyle="--", label=f"chosen operating point (~{capacity['target_alerts_per_day']:.0f}/day)")
     ax.set_xscale("log")
     ax.set_xlabel("Alerts per day (log scale)")
