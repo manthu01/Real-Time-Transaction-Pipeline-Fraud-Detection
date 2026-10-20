@@ -57,6 +57,7 @@ def make_alert_scoring_func(artifacts_dir: str, feature_names: tuple[str, ...]):
                         "triggeredRules": alert["triggeredRules"],
                         "topFeatures": alert["topFeatures"],
                         "baseValue": alert["baseValue"],
+                        "rawScore": alert["rawScore"],
                         "isoScore": alert["isoScore"],
                         "unusualFeatures": alert["unusualFeatures"],
                         "trailingMean": features.get("trailingMean"),

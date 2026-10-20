@@ -23,7 +23,14 @@ const KAFKA_MESSAGE = {
   score: 0.87,
   severity: 'HIGH',
   triggeredRules: ['IMPOSSIBLE_TRAVEL'],
-  topFeatures: [{ name: 'impliedSpeedKmh', value: 3000, zScore: 12.4 }],
+  topFeatures: [
+    { name: 'impliedSpeedKmh', value: 3000, shap: 4.21, direction: 'up' as const },
+    { name: 'secondsSincePrevTxn', value: null, shap: -0.35, direction: 'down' as const },
+  ],
+  baseValue: -10.4243,
+  rawScore: 2.1,
+  isoScore: 0.61,
+  unusualFeatures: [{ name: 'impliedSpeedKmh', value: 3000, zScore: 12.4 }],
   trailingMean: 500,
   trailingMax: 2000,
   amount: 25000,
@@ -57,6 +64,32 @@ describe('AlertsService', () => {
         expect.objectContaining({ alertId: KAFKA_MESSAGE.alertId, dispositionStatus: DispositionStatus.PENDING }),
       );
       expect(alert.dispositionStatus).toBe(DispositionStatus.PENDING);
+    });
+
+    it('persists the SHAP explanation, shadow score and z-score features', async () => {
+      (repo.findOneBy as jest.Mock).mockResolvedValue(null);
+
+      const alert = await service.ingestFromKafka(KAFKA_MESSAGE);
+
+      expect(alert.topFeatures).toEqual(KAFKA_MESSAGE.topFeatures);
+      expect(alert.baseValue).toBe(-10.4243);
+      expect(alert.rawScore).toBe(2.1);
+      expect(alert.isoScore).toBe(0.61);
+      expect(alert.unusualFeatures).toEqual(KAFKA_MESSAGE.unusualFeatures);
+    });
+
+    it('still ingests a pre-LightGBM message (z-score topFeatures, no SHAP fields) with nulls', async () => {
+      (repo.findOneBy as jest.Mock).mockResolvedValue(null);
+      const { baseValue, rawScore, isoScore, unusualFeatures, ...legacy } = KAFKA_MESSAGE;
+      const legacyMessage = { ...legacy, topFeatures: [{ name: 'impliedSpeedKmh', value: 3000, zScore: 12.4 }] };
+
+      const alert = await service.ingestFromKafka(legacyMessage);
+
+      expect(alert.topFeatures).toEqual(legacyMessage.topFeatures);
+      expect(alert.baseValue).toBeNull();
+      expect(alert.rawScore).toBeNull();
+      expect(alert.isoScore).toBeNull();
+      expect(alert.unusualFeatures).toBeNull();
     });
 
     it('is idempotent: re-ingesting the same alertId does not create a duplicate', async () => {

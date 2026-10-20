@@ -179,13 +179,20 @@ def zscore_features(artifacts: DetectionArtifacts, features: dict[str, Any], k: 
 
 
 def severity_for(fired_rules: list[Rule], probability: float) -> str:
-    if fired_rules:
-        return max((r.severity for r in fired_rules), key=lambda s: SEVERITY_RANK.get(s, -1))
-    # model-only alert, no rule matched: scale severity by the model's own
-    # confidence so analysts can still triage (see HIGH_SEVERITY_PROBABILITY).
+    """The most severe of: every fired rule's configured severity, and
+    HIGH if the model itself is confident (see HIGH_SEVERITY_PROBABILITY).
+    A rule can raise an alert's severity but never lower it below what the
+    model says -- otherwise a p=1.0 transaction that also tripped a
+    MEDIUM rule (AMOUNT_SPIKE) ranked below a model-only p=0.99 one, which
+    is exactly what happened when this was first run on real alerts."""
+    candidates = [r.severity for r in fired_rules]
     if probability >= HIGH_SEVERITY_PROBABILITY:
-        return "HIGH"
-    return "MEDIUM"
+        candidates.append("HIGH")
+    if not candidates:
+        # model-only alert below 0.5: cleared the capacity threshold, but
+        # the model isn't confident -- still worth a look, not urgent
+        return "MEDIUM"
+    return max(candidates, key=lambda s: SEVERITY_RANK.get(s, -1))
 
 
 def score_batch(artifacts: DetectionArtifacts, feature_rows: list[dict[str, Any]], raws: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
@@ -227,6 +234,10 @@ def score_batch(artifacts: DetectionArtifacts, feature_rows: list[dict[str, Any]
             "triggeredRules": [r.id for r in fired_per_row[i]],
             "topFeatures": shap_features(artifacts, feature_rows[i], contribs[row_idx]),
             "baseValue": round(float(contribs[row_idx][-1]), 4),
+            # the model's log-odds output (= baseValue + every feature's SHAP,
+            # not just the top 5): where the console's waterfall ends. Sent
+            # explicitly because logit(score) is useless once p rounds to 1.0.
+            "rawScore": round(float(contribs[row_idx].sum()), 4),
             "isoScore": round(float(iso_scores[row_idx]), 4),
             "unusualFeatures": zscore_features(artifacts, feature_rows[i]),
         }

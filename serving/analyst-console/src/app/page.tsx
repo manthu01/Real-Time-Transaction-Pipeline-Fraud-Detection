@@ -6,6 +6,7 @@ import { listAlerts } from '@/lib/api';
 import { getSocket } from '@/lib/socket';
 import type { Alert } from '@/lib/types';
 import { DispositionBadge, SeverityBadge } from '@/components/Badges';
+import { formatAlertScore, isLegacyAlert } from '@/lib/alertModel';
 
 const MAX_FEED_SIZE = 200;
 
@@ -107,7 +108,11 @@ export default function LiveFeedPage() {
                       </Link>
                     </td>
                     <td>{alert.amount != null ? `₹${alert.amount.toFixed(2)}` : '—'}</td>
-                    <td>{alert.score.toFixed(3)}</td>
+                    <td title={isLegacyAlert(alert) ? 'Isolation Forest anomaly score (alert from before the LightGBM champion)' : 'LightGBM fraud probability'}>
+                      {formatAlertScore(alert)}
+                      {/* legacy rows hold an anomaly score, not a probability -- the two aren't comparable side by side */}
+                      {isLegacyAlert(alert) && <span className="muted"> IF</span>}
+                    </td>
                     <td className="muted">{alert.triggeredRules.length > 0 ? alert.triggeredRules.join(', ') : 'model only'}</td>
                     <td>
                       <DispositionBadge status={alert.dispositionStatus} />

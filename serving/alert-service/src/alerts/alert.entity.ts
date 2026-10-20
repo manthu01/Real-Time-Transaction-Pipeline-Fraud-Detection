@@ -7,10 +7,32 @@ export enum DispositionStatus {
   NEEDS_INVESTIGATION = 'NEEDS_INVESTIGATION',
 }
 
-export interface TopFeature {
+/** One feature's TreeSHAP contribution from the LightGBM champion, in
+ * log-odds. direction "up" = pushed toward fraud. value is null when the
+ * feature was missing (e.g. secondsSincePrevTxn on a first transaction). */
+export interface ShapFeature {
+  name: string;
+  value: number | null;
+  shap: number;
+  direction: 'up' | 'down';
+}
+
+/** How far a feature sits from the non-fraud population, in standard
+ * deviations. Alerts from before the LightGBM champion carried these as
+ * their topFeatures; newer alerts carry them as unusualFeatures. */
+export interface ZScoreFeature {
   name: string;
   value: number;
   zScore: number;
+}
+
+/** topFeatures is SHAP on current alerts and z-scores on rows ingested
+ * before the switch -- both shapes stay readable rather than
+ * back-filling old rows with explanations their model never produced. */
+export type TopFeature = ShapFeature | ZScoreFeature;
+
+export function isShapFeature(feature: TopFeature): feature is ShapFeature {
+  return typeof (feature as ShapFeature).shap === 'number';
 }
 
 /**
@@ -38,6 +60,9 @@ export class Alert {
   @Column({ type: 'timestamptz' })
   timestamp: Date;
 
+  /** LightGBM fraud probability. On rows ingested before the LightGBM
+   * champion (baseValue IS NULL), this is the Isolation Forest anomaly
+   * score instead. */
   @Column({ type: 'double precision' })
   score: number;
 
@@ -50,6 +75,25 @@ export class Alert {
 
   @Column({ type: 'jsonb', default: () => "'[]'" })
   topFeatures: TopFeature[];
+
+  // The SHAP / champion-challenger columns below are nullable because rows
+  // ingested before the LightGBM champion don't have them; null means
+  // "not recorded", which the console renders as the legacy view.
+
+  /** SHAP base value: the model's average output, in log-odds. */
+  @Column({ type: 'double precision', nullable: true })
+  baseValue: number | null;
+
+  /** The model's log-odds output (baseValue + every feature's SHAP). */
+  @Column({ type: 'double precision', nullable: true })
+  rawScore: number | null;
+
+  /** Isolation Forest score, scored in shadow (never triggers an alert). */
+  @Column({ type: 'double precision', nullable: true })
+  isoScore: number | null;
+
+  @Column({ type: 'jsonb', nullable: true })
+  unusualFeatures: ZScoreFeature[] | null;
 
   @Column({ type: 'double precision', nullable: true })
   trailingMean: number | null;

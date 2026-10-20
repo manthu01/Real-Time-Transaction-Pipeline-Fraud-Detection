@@ -312,4 +312,169 @@ The Kafka alert message now carries `topFeatures` entries with `shap` /
 `direction` instead of `zScore`. The current alert service and console still
 expect `zScore` (`TopFeaturesBars` calls `f.zScore.toFixed`), so **don't
 rebuild the live stack between this commit and Phase 3**. Phase 3 adds the
-new shape and keeps old `zScore` alerts readable.
+new shape and keeps old `zScore` alerts readable. *(Resolved in Phase 3.)*
+
+---
+
+## Phase 3 — Alert service + console (`serving/`)
+
+### What changed
+
+**Scorer payload (small addition to Phase 2)**: `rawScore`, the model's
+log-odds output (= baseValue + every feature's SHAP, not just the top 5).
+Added to `score.py`, `ALERT_SCHEMA` and the Spark adapter. See problem 1.
+
+**Alert service (`serving/alert-service`)**
+- `alert.entity.ts`: `TopFeature` is now `ShapFeature | ZScoreFeature`:
+  - `ShapFeature` = `{name, value: number|null, shap, direction: "up"|"down"}`
+  - `ZScoreFeature` = the old `{name, value, zScore}`
+
+  Plus an `isShapFeature()` guard. New nullable columns: `baseValue`,
+  `rawScore`, `isoScore`, `unusualFeatures` (jsonb).
+- `kafka-alert-message.ts`: the new fields are **optional** on the wire
+  contract. `fraud.alerts` keeps 30 days of messages, so a consumer replaying
+  the topic still meets the old z-score-only shape. Validation got stricter
+  too: if a new field is present it must be the right type, and every
+  `topFeatures` entry must be an object with a `name`.
+- `alerts.service.ts`: persists the new fields, `null` when absent.
+- **Migrations replace `synchronize: true`** (`src/migrations/`):
+  - `BaselineAlertsSchema1789516800000`: the exact schema `synchronize`
+    created, including TypeORM's generated PK and index names, all
+    `IF NOT EXISTS`. It's a no-op on existing databases and builds the
+    identical schema on fresh ones.
+  - `AddShapExplanation1792454400000`: adds the 4 nullable columns. No
+    back-fill: old rows have no SHAP values to recover, and `null` is how
+    the console recognises them.
+  - `app.module.ts`: `synchronize: false`, `migrationsRun: true`. Migrations
+    are listed explicitly, not globbed, so the same list works in ts-node,
+    jest and the compiled build.
+
+**Analyst console (`serving/analyst-console`)**
+- New `ShapWaterfall.tsx` (hand-rolled, same grid style as the old bars):
+  base value → each top feature's push (**red toward fraud, blue away**) →
+  an "all other features" remainder (grey) → model output, all on one shared
+  log-odds axis. A dashed line marks log-odds 0 (p = 0.5) when the axis
+  crosses it, and the caption reads e.g. "output 20.39 → p = 1.000". The
+  remainder step means the chart always adds up exactly: SHAP additivity,
+  shown visually.
+- Model line: "Model: **LightGBM p=1.000** · Isolation Forest (shadow) 0.59".
+- Collapsed "Statistically unusual (z-score vs non-fraud customers)"
+  `<details>` section shows `unusualFeatures`.
+- `TopFeaturesBars.tsx` renamed to `ZScoreBars.tsx`. It's now used for the
+  collapsed section and as the main view on legacy alerts.
+- New `lib/alertModel.ts`: `isLegacyAlert` (= `baseValue == null`),
+  feature-shape guards, `modelOutputLogOdds`, and number formatting.
+- **Legacy alerts** (pre-LightGBM) render the old way: "Anomaly score",
+  "Model: Isolation Forest 0.62 · scored before the LightGBM champion, so no
+  SHAP explanation", and z-score bars.
+- Live feed: the score column uses `formatAlertScore` (see problem 4) and
+  tags legacy rows with "IF" (see problem 6).
+
+**Tests**
+- `alerts.service.spec.ts`: SHAP payload persisted (topFeatures, baseValue,
+  rawScore, isoScore, unusualFeatures); a pre-LightGBM message still
+  ingests, with nulls.
+- `kafka-alert-message.spec.ts`: accepts the SHAP message and the legacy
+  message; rejects wrongly-typed baseValue/rawScore/isoScore, non-object
+  topFeatures entries, and a non-array unusualFeatures.
+- `test_score.py`: `rawScore` matches the booster's raw margin; new
+  severity test (problem 5).
+
+### Problems hit and how they were fixed
+
+**1. The waterfall couldn't end at the right number.** The payload only has
+the top 5 SHAP values plus the base, and `score` is p rounded to 6 places.
+Getting the end point from logit(score) breaks for real fraud, where p
+rounds to 1.0 and the logit is infinite. One real alert had log-odds 20.39.
+**Fix:** the scorer also sends `rawScore` (the log-odds output). The
+console draws the gap between it and base + top 5 as "all other features",
+so the chart adds up exactly. For a row written without `rawScore`, the
+console falls back to a clamped logit(score).
+
+**2. A naive migration would have duplicated every index.** The service
+had been running with `synchronize: true`, so real databases already have
+the table with TypeORM's hash-named indexes (`IDX_8cecd75b…`). A baseline
+migration with hand-picked index names plus `IF NOT EXISTS` would have
+quietly added a second copy of each index. **Fix:** the baseline DDL was
+captured from TypeORM itself (`createSchemaBuilder().log()` against an empty
+database using the pre-change entity), so the names match exactly.
+
+**3. A one-off jest warning.** The first test run printed "a worker
+process has failed to exit gracefully". Ran the original (pre-change) suite
+for comparison, then the new suite twice more: no warning, 31/31 both
+times. It was a slow first run, not a leak.
+
+**4. Tiny probabilities showed as "0.000".** The feed used
+`score.toFixed(3)`, and LightGBM probabilities near the threshold are
+~2e-5. **Fix:** `formatProbability` switches to exponent form below 0.001
+(`2.3e-5`, `7.0e-4`).
+
+**5. A p = 1.0 fraud was rated MEDIUM (found on real alerts).** Publishing
+real holdout alerts through Kafka showed an alert with **p = 1.000** that
+also fired `AMOUNT_SPIKE` (a MEDIUM rule) ending up **MEDIUM**, while a
+model-only p = 0.99 alert was HIGH. Any fired rule's severity replaced the
+model's. **Fix:** severity is now the highest of the fired rules'
+severities and HIGH when p ≥ 0.5. A rule can raise severity but can't pull
+a confident model's alert down. Rules still set severity on their own when
+the model isn't confident (an `AMOUNT_SPIKE` alert at p = 0.0007 stays
+MEDIUM). On the holdout, 4 alerts moved from MEDIUM to HIGH and nothing
+else changed.
+
+**6. Two things you'd only notice by looking at the screen.**
+- The z-score bars were blue, and directly above them in the waterfall,
+  blue means "pushes away from fraud". `txnCount1Min` at z = +6 drawn
+  blue reads as exculpatory. **Fix:** z-score bars are now neutral grey with
+  the sign in the text (`z=+5.98`), and values are rounded like the
+  waterfall's.
+- The feed's single SCORE column mixed LightGBM probabilities with legacy
+  Isolation Forest scores (a legacy `0.619` right below a `p = 0.365`), and
+  those aren't comparable. **Fix:** legacy rows show `0.619 IF`, with a
+  tooltip saying what the number is.
+
+### Verification
+
+**Migrations against real Postgres 16:**
+
+| Database | How it was made | Migrations run | Remaining diff vs new entity | Rows kept | Indexes |
+|---|---|---|---|---|---|
+| test "legacy" | old entity + `synchronize`, 1 z-score alert | both | **0 statements** | 1 / 1 | 6 (PK + 5) |
+| test "fresh" | empty | both | **0 statements** | — | 6 |
+| test "legacy", second run | — | none (no-op) | 0 | 1 | 6 |
+| **real dev DB** (`pulseguard_postgres_data`) | created by the earlier phases | both, at service startup | — | **107,592 / 107,592** | 6 |
+
+"Remaining diff" is TypeORM's own `createSchemaBuilder().log()`, meaning
+the SQL `synchronize` would still want to run. Zero means the migrations
+produce exactly the entity's schema. The real dev DB was backed up with
+`pg_dump` (44 MB) before the service touched it.
+
+**End to end, through real Kafka:** 8 alerts generated by the real scorer
+from holdout transactions (model-only fraud, rules + model, rules-only at
+low p, and one with a missing feature) were published to `fraud.alerts`.
+The new alert service consumed, validated and stored all 8 with their SHAP
+fields. Then the console in Chrome, checking each case:
+- p = 1.000 fraud: base −10.42 → `secondsSincePrevTxn = 0` +28.99, and four
+  smaller red pushes → remainder −0.06 → output 20.39. Adds up exactly.
+- p = 7.0e-4 rules-only alert: a blue −0.97 bar (`distanceFromPrevKm`), a
+  grey remainder, and the p = 0.5 line correctly left out because the axis
+  doesn't reach it.
+- The "Statistically unusual" section expands and shows the z-score features.
+- A legacy alert from the 107k old rows: "Anomaly score", the Isolation
+  Forest model line, z-score bars, no crash.
+- Live feed: new and legacy rows side by side, formatted correctly.
+
+The 8 test alerts were deleted afterwards. The dev DB keeps its 107,592
+original rows and is now on the new schema version. Containers were stopped
+again.
+
+Builds: alert-service `tsc` and `nest build` OK; console `tsc` and
+`next build` OK. Tests: alert-service 31 passed (was 22), detection 42,
+streaming 21, analytics 24.
+
+### Notes
+- Throughput measured during this phase (511 µs/txn) is not comparable with
+  Phase 2's 158 µs/txn: Kafka, Postgres, the Node service and a Next dev
+  server were all running on the same machine. Latency is re-measured
+  properly in Phase 5.
+- The waterfall's axis fits the data range, so on a low-p alert (axis −10.7
+  to −7.0) small pushes look large. The caption always prints the axis
+  range, so the scale is never hidden.

@@ -191,6 +191,105 @@ tr.alert-row.is-new {
 .bar-fill.negative {
   background: var(--critical);
 }
+.bar-fill.zscore {
+  background: var(--text-dim);
+}
+
+/* SHAP waterfall: same grid as .bar-row, but bars float on a shared
+   log-odds axis instead of growing from the left edge */
+.waterfall-row {
+  grid-template-columns: 220px 1fr 70px;
+}
+.waterfall-track {
+  position: relative;
+  background: #1c2430;
+  border-radius: 3px;
+  height: 14px;
+}
+.waterfall-bar {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 2px;
+}
+.waterfall-bar.up,
+.waterfall-swatch.up {
+  background: var(--critical);
+}
+.waterfall-bar.down,
+.waterfall-swatch.down {
+  background: var(--accent);
+}
+.waterfall-bar.other {
+  background: var(--low);
+}
+.waterfall-delta {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.waterfall-delta.up {
+  color: var(--critical);
+}
+.waterfall-delta.down {
+  color: var(--accent);
+}
+.waterfall-delta.other {
+  color: var(--text-dim);
+}
+.waterfall-marker {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 3px;
+  margin-left: -1px;
+  background: var(--text);
+  border-radius: 1px;
+}
+.waterfall-midline {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-left: 1px dashed var(--text-dim);
+}
+.waterfall-total {
+  border-top: 1px solid var(--panel-border);
+  padding-top: 8px;
+  font-weight: 600;
+}
+.waterfall-caption {
+  margin-top: 4px;
+}
+.waterfall-legend {
+  margin-left: 12px;
+  white-space: nowrap;
+}
+.waterfall-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  margin: 0 4px 0 8px;
+  vertical-align: -1px;
+}
+.model-line {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin: 0 0 12px;
+}
+.model-line strong {
+  color: var(--text);
+  font-weight: 600;
+}
+details.unusual summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  margin-top: 16px;
+}
+details.unusual[open] summary {
+  margin-bottom: 10px;
+}
 
 textarea,
 select,

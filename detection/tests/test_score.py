@@ -112,6 +112,7 @@ def test_alert_when_probability_clears_threshold_carries_shadow_and_explanations
     assert alert["severity"] == "HIGH"  # model-only, p >= 0.5
     assert alert["isoScore"] == 0.5  # shadow score is reported, not used for the decision
     assert alert["baseValue"] == pytest.approx(math.log(0.9 / 0.1), abs=1e-4)
+    assert alert["rawScore"] == pytest.approx(math.log(0.9 / 0.1), abs=1e-4)  # fake booster: all SHAP is bias
     assert isinstance(alert["unusualFeatures"], list)
 
 
@@ -148,6 +149,9 @@ def test_alert_shap_features_are_ranked_signed_and_capped(real_booster):
     assert [abs(f["shap"]) for f in top] == sorted((abs(f["shap"]) for f in top), reverse=True)
     for f in top:
         assert f["direction"] == ("up" if f["shap"] > 0 else "down")
+    # the payload's rawScore is the full model output the waterfall ends at
+    X = feature_matrix(artifacts, [features])
+    assert alert["rawScore"] == pytest.approx(real_booster.predict(X, raw_score=True)[0], abs=1e-4)
     # both drivers of the synthetic label pushed toward fraud
     names_up = {f["name"] for f in top if f["direction"] == "up"}
     assert {"txnCount1Min", "secondsSincePrevTxn"} <= names_up
@@ -215,6 +219,15 @@ def test_shap_features_skips_unused_features_and_the_bias_column():
 def test_model_only_severity_uses_probability():
     assert severity_for([], probability=0.93) == "HIGH"
     assert severity_for([], probability=0.001) == "MEDIUM"
+
+
+def test_confident_model_is_not_downgraded_by_a_weaker_rule():
+    medium_rule = [r for r in load_rules() if r.id == "AMOUNT_SPIKE"]  # MEDIUM
+    assert severity_for(medium_rule, probability=1.0) == "HIGH"
+    # but a rule still sets severity on its own when the model isn't confident
+    assert severity_for(medium_rule, probability=0.0007) == "MEDIUM"
+    critical_rule = [r for r in load_rules() if r.id == "ATO_SIGNATURE"]
+    assert severity_for(critical_rule, probability=0.99) == "CRITICAL"
 
 
 def test_multiple_fired_rules_report_highest_severity():

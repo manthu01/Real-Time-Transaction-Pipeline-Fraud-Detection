@@ -9,7 +9,9 @@ import type { Alert } from '@/lib/types';
 import { DispositionBadge, SeverityBadge } from '@/components/Badges';
 import { DispositionForm } from '@/components/DispositionForm';
 import { GeoEmbed } from '@/components/GeoEmbed';
-import { TopFeaturesBars } from '@/components/TopFeaturesBars';
+import { ShapWaterfall } from '@/components/ShapWaterfall';
+import { ZScoreBars } from '@/components/ZScoreBars';
+import { formatAlertScore, formatProbability, isLegacyAlert, modelOutputLogOdds, shapFeatures, zScoreFeatures } from '@/lib/alertModel';
 
 export default function AlertDetailPage() {
   // useParams() rather than a `params` prop: in Next.js 15, a page's
@@ -47,6 +49,8 @@ export default function AlertDetailPage() {
   </div>;
   if (!alert) return <div className="container"><p className="muted">Loading…</p></div>;
 
+  const legacy = isLegacyAlert(alert);
+
   return (
     <div className="container">
       <p style={{ marginBottom: 12 }}>
@@ -75,8 +79,8 @@ export default function AlertDetailPage() {
           <dd>
             {alert.merchantId ?? '—'} ({alert.merchantCategory ?? '—'})
           </dd>
-          <dt>Anomaly score</dt>
-          <dd>{alert.score.toFixed(4)}</dd>
+          <dt>{legacy ? 'Anomaly score' : 'Fraud probability'}</dt>
+          <dd>{formatAlertScore(alert)}</dd>
           <dt>Customer trailing mean</dt>
           <dd>{alert.trailingMean != null ? `₹${alert.trailingMean.toFixed(2)}` : '—'}</dd>
         </dl>
@@ -84,6 +88,17 @@ export default function AlertDetailPage() {
 
       <div className="panel">
         <h2>Why this fired</h2>
+        {legacy ? (
+          <p className="model-line">
+            Model: <strong>Isolation Forest {alert.score.toFixed(2)}</strong> · scored before the LightGBM champion, so no SHAP
+            explanation
+          </p>
+        ) : (
+          <p className="model-line">
+            Model: <strong>LightGBM p={formatProbability(alert.score)}</strong>
+            {alert.isoScore != null && <> · Isolation Forest (shadow) {alert.isoScore.toFixed(2)}</>}
+          </p>
+        )}
         {alert.triggeredRules.length > 0 ? (
           <p>
             Triggered rules:{' '}
@@ -94,12 +109,26 @@ export default function AlertDetailPage() {
             ))}
           </p>
         ) : (
-          <p className="muted">No rule fired — flagged by the anomaly model alone.</p>
+          <p className="muted">No rule fired — flagged by the {legacy ? 'anomaly model' : 'LightGBM model'} alone.</p>
         )}
         <h3 style={{ fontSize: 13, color: 'var(--text-dim)', textTransform: 'uppercase', marginTop: 16 }}>
-          Top contributing features
+          {legacy ? 'Top contributing features (z-score)' : 'Why the model scored it this way (SHAP)'}
         </h3>
-        <TopFeaturesBars features={alert.topFeatures} />
+        {legacy ? (
+          <ZScoreBars features={zScoreFeatures(alert.topFeatures)} />
+        ) : (
+          <>
+            <ShapWaterfall
+              features={shapFeatures(alert)}
+              baseValue={alert.baseValue!}
+              rawScore={modelOutputLogOdds(alert)}
+            />
+            <details className="unusual">
+              <summary>Statistically unusual (z-score vs non-fraud customers)</summary>
+              <ZScoreBars features={alert.unusualFeatures ?? []} />
+            </details>
+          </>
+        )}
       </div>
 
       {alert.lat != null && alert.lon != null && (

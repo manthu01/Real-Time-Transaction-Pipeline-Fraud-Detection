@@ -4,6 +4,7 @@ import { AlertsModule } from './alerts/alerts.module';
 import { env } from './config/env';
 import { KafkaConsumerModule } from './kafka/kafka-consumer.module';
 import { MetricsModule } from './metrics/metrics.module';
+import { MIGRATIONS } from './migrations';
 
 @Module({
   imports: [
@@ -15,9 +16,13 @@ import { MetricsModule } from './metrics/metrics.module';
       password: env.postgres.password,
       database: env.postgres.database,
       autoLoadEntities: true,
-      // fine for this project's scale and the fact that the schema is
-      // small and stable; a production deployment would use migrations.
-      synchronize: true,
+      // Schema changes go through migrations (src/migrations), applied at
+      // startup. This used to be `synchronize: true`; the first migration
+      // reproduces exactly what synchronize created, so databases from
+      // before the switch upgrade in place without losing rows.
+      synchronize: false,
+      migrations: MIGRATIONS,
+      migrationsRun: true,
     }),
     AlertsModule,
     KafkaConsumerModule,

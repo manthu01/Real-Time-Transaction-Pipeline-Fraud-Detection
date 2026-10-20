@@ -101,6 +101,7 @@ ALERT_SCHEMA = StructType(
         StructField("triggeredRules", ArrayType(StringType())),
         StructField("topFeatures", ArrayType(TOP_FEATURE_STRUCT)),
         StructField("baseValue", DoubleType()),
+        StructField("rawScore", DoubleType()),
         StructField("isoScore", DoubleType()),
         StructField("unusualFeatures", ArrayType(UNUSUAL_FEATURE_STRUCT)),
         StructField("trailingMean", DoubleType()),

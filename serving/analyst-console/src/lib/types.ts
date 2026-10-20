@@ -6,11 +6,24 @@
 export type DispositionStatus = 'PENDING' | 'CONFIRMED_FRAUD' | 'FALSE_POSITIVE' | 'NEEDS_INVESTIGATION';
 export type Severity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
 
-export interface TopFeature {
+/** TreeSHAP contribution from the LightGBM champion, in log-odds;
+ * direction "up" = pushed toward fraud. value null = feature was missing. */
+export interface ShapFeature {
+  name: string;
+  value: number | null;
+  shap: number;
+  direction: 'up' | 'down';
+}
+
+/** Standard deviations from the non-fraud population. Pre-LightGBM alerts
+ * carry these as topFeatures; current ones as unusualFeatures. */
+export interface ZScoreFeature {
   name: string;
   value: number;
   zScore: number;
 }
+
+export type TopFeature = ShapFeature | ZScoreFeature;
 
 export interface Alert {
   alertId: string;
@@ -21,6 +34,11 @@ export interface Alert {
   severity: Severity;
   triggeredRules: string[];
   topFeatures: TopFeature[];
+  // null on alerts ingested before the LightGBM champion -- see isLegacyAlert
+  baseValue: number | null;
+  rawScore: number | null;
+  isoScore: number | null;
+  unusualFeatures: ZScoreFeature[] | null;
   trailingMean: number | null;
   trailingMax: number | null;
   amount: number | null;
