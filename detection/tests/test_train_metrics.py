@@ -28,6 +28,18 @@ def test_time_split_produces_strictly_ordered_train_before_holdout():
     assert len(train) + len(holdout) == len(df)
 
 
+def test_time_split_does_not_depend_on_row_order():
+    # bronze rows come back from Spark unsorted; the split must still be
+    # 75/25 by time, identical to splitting the sorted frame
+    df = pd.DataFrame({"timestamp": pd.date_range("2026-01-01", periods=1000, freq="min")})
+    shuffled = df.sample(frac=1.0, random_state=0)
+    train, holdout = time_split(shuffled, train_fraction=0.75)
+    assert len(train) == 750 and len(holdout) == 250
+    assert train["timestamp"].max() < holdout["timestamp"].min()
+    sorted_train, _ = time_split(df, train_fraction=0.75)
+    assert set(train.index) == set(sorted_train.index)
+
+
 def test_detection_rate_per_pattern_splits_recall_by_injected_pattern():
     holdout_df = pd.DataFrame(
         {

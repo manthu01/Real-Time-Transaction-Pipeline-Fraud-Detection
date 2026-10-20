@@ -15,20 +15,19 @@ between training and serving so the two never drift apart.
 
 ![Live feed, drill-down, disposition, and metrics against the running stack](docs/demo.gif)
 
-*Recorded against the actual `docker compose up` stack: the live feed,
-opening an alert's drill-down (triggered rule, top contributing features,
-map, the customer's other recent alerts), submitting a real disposition
-(note + Confirmed Fraud), and the metrics page updating from it —
-`THRESHOLD_STRUCTURING`'s precision reflects that submission.* This
-recording predates the LightGBM champion: the drill-down now explains
-the model's score as a SHAP waterfall instead of the z-score bars shown
-here, captured below from the same live stack.
+*Recorded against the actual `docker compose up` stack with live traffic
+flowing: new alerts arriving on the feed, opening a model-only alert
+(LightGBM p = 2.9e-4, Isolation Forest shadow 0.54), its SHAP waterfall
+(evening hour and an amount 2.8x the customer's trailing max pushing it
+up from the −10.42 base value), the collapsed "statistically unusual"
+z-score view, a real disposition (note + False Positive), and the metrics
+page.* A second live alert, a high-confidence one:
 
 ![SHAP waterfall for a live alert](docs/shap-waterfall.jpg)
 
 *A live alert from the running stack: a model-only card-testing catch.
 LightGBM starts from its base value (−10.42 log-odds), four transactions
-in the last minute pushes it +28.55, being in the exact same place as the
+in the last minute push it +28.55, being in the exact same place as the
 previous transaction another +5.15, and it ends at 24.99 → p = 1.000. The
 Isolation Forest, scoring in shadow, gave it 0.58.*
 
@@ -890,6 +889,25 @@ data accumulated across this project's own testing (49,644 rows):
   isn't automatically better data, and a nightly job that blindly
   retrained-and-deployed on whatever showed up would have made the
   production model worse.
+- **Since LightGBM became the champion, the check covers both deployed
+  models**, each against its own recorded PR-AUC: a LightGBM challenger
+  vs the champion's 0.906, and an Isolation Forest challenger vs the
+  shadow's 0.457. (Before, it retrained only an Isolation Forest and
+  called that number "the champion", which would have left the model
+  that actually decides alerts unchecked.) Run against the bronze data
+  accumulated by the LightGBM live runs (133,068 rows, heavily drifted:
+  PSI flags 22 of 26 features): LightGBM challenger 0.542 vs 0.906,
+  Isolation Forest challenger 0.237 vs 0.457. Both report-only, both
+  correctly "don't promote".
+- **That run also exposed a bug in the split itself.** `time_split`
+  took its cutoff timestamp by row position, silently assuming
+  time-sorted input. The training dataset is sorted; bronze rows
+  collected from Spark aren't, so the nightly "75/25" split cut at an
+  arbitrary row's timestamp: 59% of rows landed in the holdout. The
+  cutoff now comes from the sorted timestamps (exactly 25% on the rerun;
+  the training split, and so every metric above, is unchanged). The
+  0.362-vs-0.378 result in the previous bullet came from the unsorted
+  version, so treat it as indicative rather than exact.
 
 ## Load testing and failure drills
 

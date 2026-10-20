@@ -1,9 +1,16 @@
-"""Nightly champion-vs-challenger check: retrain a candidate Isolation
-Forest on fresh bronze data, evaluate it against the deployed champion's
-recorded metrics on a comparable holdout, and report the comparison.
-Report only -- this never overwrites detection/artifacts/, matching the
-build plan's explicit "evaluate against champion on a holdout, report but
-do not auto-promote."
+"""Nightly champion-vs-challenger check: retrain a candidate of each
+deployed model on fresh bronze data, evaluate it on a comparable holdout,
+and report it next to that model's recorded metrics. Report only -- this
+never overwrites detection/artifacts/, matching the build plan's explicit
+"evaluate against champion on a holdout, report but do not auto-promote."
+
+Two deployed models, so two comparisons, each against its own number:
+  - LightGBM, the champion that decides alerts, vs metrics.json's
+    lightgbm.pr_auc
+  - the Isolation Forest scoring in shadow, vs isolation_forest.pr_auc
+Comparing an Isolation Forest challenger against "the champion" (as this
+did before LightGBM was promoted) would now be comparing against the
+wrong model -- and would leave the model that actually alerts unchecked.
 
 Reuses pulseguard_detection.train's already-tested functions rather than
 reimplementing training here: bronze's schema (timestamp + the 26 features
@@ -23,15 +30,59 @@ import pandas as pd
 from sklearn.metrics import average_precision_score
 
 from pulseguard_detection.dataset import FEATURE_NAMES
-from pulseguard_detection.train import isolation_forest_scores, time_split, train_isolation_forest
+from pulseguard_detection.train import (
+    isolation_forest_scores,
+    lightgbm_scores,
+    time_split,
+    train_isolation_forest,
+    train_lightgbm,
+)
+
+# metrics.json key -> the role that model plays in live scoring
+DEPLOYED_MODELS = {"lightgbm": "champion", "isolation_forest": "shadow"}
+LIGHTGBM_VAL_FRACTION = 0.15  # train_lightgbm's own early-stopping split
 
 
-def load_champion_pr_auc(artifacts_dir: str | Path) -> float | None:
+def load_deployed_pr_auc(artifacts_dir: str | Path, model: str) -> float | None:
     metrics_path = Path(artifacts_dir) / "metrics.json"
     if not metrics_path.exists():
         return None
     metrics = json.loads(metrics_path.read_text())
-    return metrics.get("isolation_forest", {}).get("pr_auc")
+    return metrics.get(model, {}).get("pr_auc")
+
+
+def load_champion_pr_auc(artifacts_dir: str | Path) -> float | None:
+    return load_deployed_pr_auc(artifacts_dir, "lightgbm")
+
+
+def _challenger_scores(model: str, train_df: pd.DataFrame, holdout_df: pd.DataFrame):
+    if model == "lightgbm":
+        return lightgbm_scores(train_lightgbm(train_df, val_fraction=LIGHTGBM_VAL_FRACTION), holdout_df)
+    return isolation_forest_scores(train_isolation_forest(train_df), holdout_df)
+
+
+def _compare_one(model: str, train_df: pd.DataFrame, holdout_df: pd.DataFrame, artifacts_dir: str | Path) -> dict:
+    entry: dict = {"role": DEPLOYED_MODELS[model]}
+    if model == "lightgbm":
+        # early stopping scores a validation split carved from the tail of
+        # train; with no fraud in it there is nothing to stop on
+        _, val = time_split(train_df, 1 - LIGHTGBM_VAL_FRACTION)
+        if val["isFraud"].sum() == 0:
+            return {**entry, "status": "SKIPPED", "reason": "no fraud rows in LightGBM's early-stopping validation split"}
+
+    scores = _challenger_scores(model, train_df, holdout_df)
+    challenger_pr_auc = float(average_precision_score(holdout_df["isFraud"].astype(int), scores))
+    deployed_pr_auc = load_deployed_pr_auc(artifacts_dir, model)
+    entry.update(
+        {
+            "status": "EVALUATED",
+            "challenger_pr_auc": round(challenger_pr_auc, 4),
+            "deployed_pr_auc": round(deployed_pr_auc, 4) if deployed_pr_auc is not None else None,
+        }
+    )
+    if deployed_pr_auc is not None:
+        entry["challenger_better"] = challenger_pr_auc > deployed_pr_auc
+    return entry
 
 
 def retrain_and_compare(bronze_pdf: pd.DataFrame, champion_artifacts_dir: str | Path) -> dict:
@@ -48,20 +99,10 @@ def retrain_and_compare(bronze_pdf: pd.DataFrame, champion_artifacts_dir: str | 
     if holdout_df["isFraud"].sum() == 0:
         return {"status": "SKIPPED", "reason": "holdout split has zero fraud examples"}
 
-    challenger = train_isolation_forest(train_df)
-    challenger_scores = isolation_forest_scores(challenger, holdout_df)
-    challenger_pr_auc = float(average_precision_score(holdout_df["isFraud"].astype(int), challenger_scores))
-
-    champion_pr_auc = load_champion_pr_auc(champion_artifacts_dir)
-
-    result = {
+    return {
         "status": "EVALUATED",
-        "challenger_pr_auc": round(challenger_pr_auc, 4),
-        "champion_pr_auc": round(champion_pr_auc, 4) if champion_pr_auc is not None else None,
         "holdout_size": int(len(holdout_df)),
         "holdout_fraud_count": int(holdout_df["isFraud"].sum()),
+        "models": {model: _compare_one(model, train_df, holdout_df, champion_artifacts_dir) for model in DEPLOYED_MODELS},
         "recommendation": "report only -- no auto-promotion",
     }
-    if champion_pr_auc is not None:
-        result["challenger_better"] = challenger_pr_auc > champion_pr_auc
-    return result

@@ -164,14 +164,16 @@ budget would buy.
 ### Open items carried into later phases
 - `severity_for` escalates to HIGH at `score >= 1.5 × threshold`. With a
   LightGBM threshold of 3.3e-5 that rule becomes meaningless → Phase 2.
+  *(Resolved in Phase 2.)*
 - `analytics/pulseguard_analytics/retrain_check.py` still compares an IF
   challenger against `metrics.isolation_forest.pr_auc` and calls it the
   "champion". The comparison still works, but the label is now wrong
   (LightGBM is the champion). Out of the spec's scope; left as-is.
+  *(Resolved in the follow-up at the end: it now checks both models.)*
 - scikit-learn version mismatch (1.7.2 local vs 1.5.2 in the image) for the
-  IF pickle — pre-existing.
+  IF pickle — pre-existing. *(Still open; see the follow-up.)*
 - LightGBM 4.7 prints a deprecation warning for `eval_set=` in `fit()`;
-  harmless, left alone.
+  harmless, left alone. *(Resolved in the follow-up.)*
 
 Tests: detection 36 passed, analytics 24 passed.
 
@@ -715,14 +717,12 @@ each customer's rolling state kept accumulating. Alert *counts* across
 runs aren't comparable for that reason; the identical-rows table above is
 the fair comparison.
 
-### 4. Demo GIF: not regenerated
-Recording started (live feed with alerts arriving, the drill-down, the
-expanded z-score section). Chrome screenshots then started timing out
-intermittently on the detail page while the map iframe was rendering, and
-then the browser extension disconnected. Rather than keep retrying,
-**the old GIF is kept** and the README now says it predates SHAP, with the
-live-stack waterfall screenshot (`docs/shap-waterfall.jpg`) directly under
-it. The re-record is still to do.
+### 4. Demo GIF
+First attempt: recording started (live feed with alerts arriving, the
+drill-down, the expanded z-score section), then Chrome screenshots started
+timing out intermittently on the detail page while the map iframe rendered,
+and the browser extension disconnected. That commit kept the old GIF,
+marked as predating SHAP. **Re-recorded in the follow-up below.**
 
 ### 5. README
 - Intro, Status (Phase 3 bullet, with a link to this log), architecture
@@ -764,7 +764,7 @@ unit test.
 - [x] Console shows the SHAP waterfall, and old alerts still render
 - [x] Offline SHAP report + plots generated
 - [x] All existing tests still pass; latency re-measured (and a 3x regression found and fixed)
-- [ ] Demo GIF regenerated: **not done** (browser extension disconnected); a live-stack screenshot stands in
+- [x] Demo GIF regenerated (in the follow-up, after the browser extension reconnected)
 
 ## Resume line, with the real numbers
 
@@ -781,3 +781,102 @@ be used honestly: hybrid precision went to 0.036, because at 200 alerts/day
 for ~12 frauds/day precision is capped near 6% for any model. The
 improvement is in recall, and in precision at a right-sized budget (0.71 vs
 0.52 at 15/day).
+
+---
+
+## Follow-up — closing the remaining items
+
+After Phase 5, the open items were the demo GIF (the one unchecked spec
+item) and the Phase 1 "open items" list. All of them are handled here
+except the scikit-learn pin, which is explained below.
+
+### 1. Demo GIF re-recorded
+With the browser extension reconnected, the stack was started from the
+already-built images (no rebuild, so nothing uncommitted got baked in),
+with a light live stream at 2 tx/s. Recorded 23 frames:
+- the live feed receiving a batch of new alerts
+- opening a live model-only alert (LightGBM p = 2.9e-4, IF shadow 0.54)
+- its SHAP waterfall (`hourOfDay = 21` +0.87, `amountToTrailingMaxRatio
+  = 2.83` +0.68, …, output −8.14)
+- the expanded "statistically unusual" z-score section
+- a real **False Positive** disposition with a note
+- the metrics page
+
+Exported **with the watermark turned off**, then checked frame by frame:
+no branding anywhere. Saved over `docs/demo.gif`, and the README caption
+now describes what this recording actually shows.
+
+Small honesty note: I clicked a model-only alert in row 2, but the feed
+shifted under the click as a new batch arrived, so a different live alert
+opened. It's an equally typical alert, so the recording continued with it,
+and the caption describes the one that's actually shown.
+
+### 2. The nightly retrain-check now checks both deployed models
+**Problem:** since Phase 1, LightGBM decides alerts, but the nightly check
+still retrained only an Isolation Forest and labelled its comparison
+"champion". So the model that actually alerts was never re-checked.
+**Fix** (`analytics/pulseguard_analytics/retrain_check.py`): one challenger
+per deployed model, each compared with its *own* number from `metrics.json`:
+
+```
+"models": {
+  "lightgbm":         {"role": "champion", "challenger_pr_auc": …, "deployed_pr_auc": …, "challenger_better": …},
+  "isolation_forest": {"role": "shadow",   ...}
+}
+```
+The LightGBM challenger reports `SKIPPED` (with a reason) if its
+early-stopping validation split has no fraud, instead of crashing; the
+other check still runs. `analytics/Dockerfile` now installs
+`lightgbm==4.7.0`. Its comment had explicitly said it wasn't needed,
+which stopped being true once LightGBM became the champion.
+Tests: both models evaluated, each compared against its own deployed
+number, and the LightGBM skip path (analytics 25 passed).
+
+### 3. A real bug the retrain-check run exposed: `time_split` assumed sorted input
+The first real nightly run (built from a clean worktree, on the 133,068
+bronze rows the live runs produced) reported a **78,694-row holdout: 59%,
+not 25%**. `time_split` took its cutoff timestamp by row position
+(`df["timestamp"].iloc[cutoff_idx]`). The training dataset is sorted, so
+training was never affected, but bronze rows collected from Spark come back
+in no particular order, so the nightly "75/25" split cut at an arbitrary
+row's timestamp. This bug predates this work: the README's older
+0.362-vs-0.378 retrain result was produced with it.
+
+**Fix:** the cutoff now comes from the *sorted* timestamps
+(`sort_values(kind="stable").iloc[cutoff_idx]`). Nothing is reordered, so
+sorted input gives byte-identical splits. Verified: the training split is
+still exactly 140,969 / 46,990, so every committed metric and model stays
+valid without retraining. New test: a shuffled frame splits exactly
+750/250 by time, identical to the sorted one.
+
+Rerun on real bronze: holdout **33,267 rows = exactly 25%**.
+
+| Deployed model | Challenger PR-AUC (drifted bronze) | Deployed PR-AUC | Promote? |
+|---|---|---|---|
+| LightGBM (champion) | 0.542 | 0.906 | no |
+| Isolation Forest (shadow) | 0.237 | 0.457 | no |
+
+PSI flagged 22 of 26 features as significantly drifted on the same data,
+the same out-of-distribution load-test traffic Phase 5 documented. The
+report-only design did its job: retraining on this data and auto-deploying
+would have made both models much worse.
+
+### 4. `eval_set` deprecation fixed
+`train_lightgbm` now uses `eval_X=` / `eval_y=` (added in LightGBM 4.7.0,
+exactly the pinned version) instead of the deprecated `eval_set=`.
+Verified equivalent: the same data fitted both ways gives the same best
+iteration and a maximum prediction difference of 0.0, so no retrain was
+needed. Tests now pass with `-W error::DeprecationWarning`.
+
+### 5. Still open, on purpose: the scikit-learn pickle version
+The Isolation Forest is pickled with scikit-learn 1.7.2 (the local
+version) while the Spark image pins 1.5.2, which logs an
+`InconsistentVersionWarning` at load. This predates this work (the
+original artifact was already 1.7.2), it loads and scores correctly in
+every live run here, and fixing it properly means retraining in a
+1.5.2 environment, which would change the committed Isolation Forest
+metrics this whole log compares against. The right moment for that is the
+next deliberate retrain, not a clean-up pass.
+
+### Tests after the follow-up
+detection 45, streaming 21, analytics 25 (91 total), alert-service 31.

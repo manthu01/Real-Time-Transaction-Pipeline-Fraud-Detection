@@ -56,9 +56,16 @@ def time_split(df: pd.DataFrame, train_fraction: float = 0.75) -> tuple[pd.DataF
     """Splits strictly by time, not randomly -- a random split would leak
     a customer's future transactions into the features of their past ones
     (the whole point of the rolling-window features is that they depend on
-    what came before)."""
+    what came before).
+
+    The cutoff comes from the *sorted* timestamps, so `df` doesn't need to
+    be in time order. It used to be `df["timestamp"].iloc[cutoff_idx]`,
+    which silently assumed it was: fine for dataset.py's output (sorted),
+    but bronze rows collected from Spark arrive in no particular order, so
+    the nightly retrain-check's "75/25" split cut at an arbitrary row's
+    timestamp (one real run put 59% of rows in the holdout)."""
     cutoff_idx = int(len(df) * train_fraction)
-    cutoff_time = df["timestamp"].iloc[cutoff_idx]
+    cutoff_time = df["timestamp"].sort_values(kind="stable").iloc[cutoff_idx]
     train = df[df["timestamp"] < cutoff_time]
     holdout = df[df["timestamp"] >= cutoff_time]
     return train, holdout
@@ -129,7 +136,8 @@ def train_lightgbm(train_df: pd.DataFrame, val_fraction: float = 0.15) -> lgb.LG
     model.fit(
         X_tr,
         y_tr,
-        eval_set=[(X_val, y_val)],
+        eval_X=X_val,  # eval_X/eval_y need lightgbm>=4.7 (pinned); eval_set is deprecated
+        eval_y=y_val,
         eval_metric="average_precision",
         callbacks=[lgb.early_stopping(stopping_rounds=30, verbose=False)],
     )

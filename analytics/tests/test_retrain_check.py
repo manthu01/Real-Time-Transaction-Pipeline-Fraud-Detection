@@ -37,28 +37,48 @@ def test_skips_when_too_few_fraud_rows():
     assert "fewer than 5" in result["reason"]
 
 
-def test_evaluates_and_reports_without_promoting():
+def test_evaluates_both_deployed_models_and_reports_without_promoting():
     df = _synthetic_bronze(n_rows=3000, fraud_rate=0.03, seed=2)
     result = retrain_and_compare(df, champion_artifacts_dir="/nonexistent")
     assert result["status"] == "EVALUATED"
-    assert 0.0 <= result["challenger_pr_auc"] <= 1.0
-    assert result["champion_pr_auc"] is None  # no champion artifacts at that path
     assert result["recommendation"] == "report only -- no auto-promotion"
-    assert "challenger_better" not in result  # can't compare without a champion number
+    assert set(result["models"]) == {"lightgbm", "isolation_forest"}
+    assert result["models"]["lightgbm"]["role"] == "champion"
+    assert result["models"]["isolation_forest"]["role"] == "shadow"
+    for entry in result["models"].values():
+        assert entry["status"] == "EVALUATED"
+        assert 0.0 <= entry["challenger_pr_auc"] <= 1.0
+        assert entry["deployed_pr_auc"] is None  # no artifacts at that path
+        assert "challenger_better" not in entry  # can't compare without a deployed number
 
 
-def test_compares_against_champion_when_metrics_file_exists(tmp_path):
+def test_each_challenger_is_compared_against_its_own_deployed_model(tmp_path):
     artifacts_dir = tmp_path / "artifacts"
     artifacts_dir.mkdir()
-    (artifacts_dir / "metrics.json").write_text(json.dumps({"isolation_forest": {"pr_auc": 0.5}}))
+    (artifacts_dir / "metrics.json").write_text(
+        json.dumps({"lightgbm": {"pr_auc": 0.9}, "isolation_forest": {"pr_auc": 0.5}})
+    )
 
-    assert load_champion_pr_auc(artifacts_dir) == 0.5
+    assert load_champion_pr_auc(artifacts_dir) == 0.9  # the champion is LightGBM, not the Isolation Forest
 
     df = _synthetic_bronze(n_rows=3000, fraud_rate=0.03, seed=3)
     result = retrain_and_compare(df, champion_artifacts_dir=artifacts_dir)
-    assert result["status"] == "EVALUATED"
-    assert result["champion_pr_auc"] == 0.5
-    assert "challenger_better" in result
+    assert result["models"]["lightgbm"]["deployed_pr_auc"] == 0.9
+    assert result["models"]["isolation_forest"]["deployed_pr_auc"] == 0.5
+    assert all("challenger_better" in entry for entry in result["models"].values())
+
+
+def test_lightgbm_challenger_skips_when_its_validation_split_has_no_fraud():
+    df = _synthetic_bronze(n_rows=3000, fraud_rate=0.03, seed=4)
+    # clear fraud out of the slice train_lightgbm early-stops on (the tail of
+    # the train split), keeping it everywhere else
+    train_end = int(len(df) * 0.75)
+    val_start = int(train_end * 0.85)
+    df.loc[val_start - 5 : train_end + 5, "isFraud"] = False
+    result = retrain_and_compare(df, champion_artifacts_dir="/nonexistent")
+    assert result["models"]["lightgbm"]["status"] == "SKIPPED"
+    assert "validation split" in result["models"]["lightgbm"]["reason"]
+    assert result["models"]["isolation_forest"]["status"] == "EVALUATED"  # the other check still runs
 
 
 def test_load_champion_pr_auc_missing_file_returns_none(tmp_path):
