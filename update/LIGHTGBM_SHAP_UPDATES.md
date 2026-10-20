@@ -602,3 +602,182 @@ Top features by mean |SHAP| on **fraud rows** (vs all rows):
 
 Tests: detection 44 passed (41 + 3 new). Report runtime ~4 min, nearly all
 of it rebuilding the 188k-row feature dataset.
+
+---
+
+## Phase 5 — Verify live + README
+
+### How the stack was run
+- **From a clean checkout of the pushed `main`** (a separate git
+  worktree), not from the working folder. The working folder had
+  uncommitted, unrelated streaming changes (a late-events side query and a
+  `foreachBatch` bronze writer) that would otherwise have been baked into
+  the Spark image and would have skewed the latency comparison. Same compose
+  project name, so the same Kafka/Postgres/checkpoint volumes were used.
+- The gitignored model binaries were copied into the worktree.
+- **The console was published on port 3006** through a local-only compose
+  override, because another app on this machine already holds port 3000.
+  Nothing about that is committed.
+- **Checked before starting Spark:** its checkpoint was at offset 112,196
+  on every query, equal to the end of `raw.transactions`, so there was no
+  backlog to replay into the measurements.
+
+### 1. Live verification (fraud-heavy burst)
+90 s at 20 tx/s with a 5% fraud-burst rate (1,801 transactions):
+- **495 alerts; all 495 carry SHAP `topFeatures`, `baseValue` and
+  `rawScore`**; 262 model-only, 233 with rules (all 6 rules fired at least
+  once).
+- The new alert service consumed them all, with migrations already
+  applied.
+- The console (built from the Docker image, not dev mode) rendered a live
+  model-only card-testing alert as a waterfall: base −10.42 →
+  `txnCount1Min = 4` +28.55 → `distanceFromPrevKm = 0` +5.15 → … → 24.99,
+  p = 1.000, Isolation Forest shadow 0.58. Saved as `docs/shap-waterfall.jpg`.
+
+### 2. Latency: a real 3x regression, found and fixed
+
+The first clean LightGBM run looked bad, so both images were run back to
+back as a fair A/B instead of comparing against the README's weeks-old
+number. Each run: wait until the alerts-query checkpoint equals the topic's
+end offset, then 180 s of seeded load-test traffic at 20 tx/s, with a
+dedicated probe consumer (`latest` offsets) recording alert publish time
+minus transaction time.
+
+| Spark image | p50 | p95 | p99 | max | falling-behind batches (median) |
+|---|---|---|---|---|---|
+| Isolation Forest, pre-LightGBM `65f593e` | 12.2 s | 17.5 s | 18.9 s | 20.2 s | 9.1 s |
+| LightGBM + SHAP, default threading | 33.6 s | 57.7 s | 64.6 s | 68.1 s | 22.8 s |
+| LightGBM + SHAP, `OMP_NUM_THREADS=1` (env var only) | 14.3 s | 21.0 s | 22.7 s | 25.0 s | 10.1 s |
+| LightGBM + SHAP, `PREDICT_THREADS = 1` in code (**shipped**) | **13.9 s** | 21.2 s | 23.2 s | 25.7 s | 9.3 s |
+
+The Isolation Forest baseline (12.2 s) reproduces the README's original
+10.6 s reasonably, so the setup is comparable.
+
+**Problem: why was LightGBM 3x slower?** It couldn't be the model's actual
+work: offline, the whole scoring path costs ~160 µs per transaction, under
+a second for the entire run, and *every* query's batches slowed down, not
+just the alerts query. Hypothesis: **OpenMP thread oversubscription**.
+LightGBM's `predict` defaults to one OpenMP thread per core, and idle OpenMP
+threads spin. The container sees all 12 host cores, so every Python worker
+that scored a batch started a 12-thread spinning team alongside the JVM and
+the other queries' workers, all on a `local[2]` budget.
+
+**Test:** reran the identical image with `OMP_NUM_THREADS=1` and no code
+change. p50 went from 33.6 s to 14.3 s, so the hypothesis was confirmed.
+
+**Fix:** `score.py` passes `num_threads=PREDICT_THREADS` (= 1) to both
+`predict` calls, with the measurement in a comment. It's done in code
+rather than as a compose env var so it holds wherever the scorer runs. The
+image was rebuilt *with no env var* and re-measured: p50 13.9 s. Batches
+are a few hundred rows, too small for intra-batch threading to pay off, and
+Spark already parallelises across partitions.
+
+What's left: ~1.7 s at p50 over the Isolation Forest, in a run that
+produced ~2.9x as many alerts, each paying for TreeSHAP and a Kafka write.
+
+### 3. Alert volume on load-test traffic (open problem, documented)
+
+The LightGBM runs alerted on a far larger share of load-test traffic than
+the Isolation Forest run (one run: 2,983 alerts from 3,601 transactions).
+Two things had to be separated:
+
+**a) Is the live scoring wrong?** The exact feature rows Spark wrote to
+bronze Delta were rescored offline with the same code (a one-off
+spark-submit inside the container). **3,008 of 3,009 live alert scores
+matched exactly.** The single mismatch also had a mismatched Isolation
+Forest score, so its *feature row* differed between the bronze query and
+the alerts query (each recomputes features in its own state store: the
+documented three-consumers design), not a scoring bug.
+
+**b) What does each detector do on identical rows?** Same 8,249 bronze rows:
+
+| Detector at its capacity threshold | Load-test rows flagged | Calibrated holdout rate |
+|---|---|---|
+| Rules | 9.3% | 1.33% |
+| Isolation Forest | 35.2% | 2.22% |
+| LightGBM (200/day, p ≥ 3.3e-5) | **79.9%** | 2.56% |
+| LightGBM at 50/day (p ≥ 9.8e-5) | 36.9% | 0.55% |
+| LightGBM at 15/day (p ≥ 0.011) | 13.5% | 0.17% |
+
+**A correction to my own first read:** I initially blamed the low 200/day
+threshold, which sits just above the model's base rate (3.0e-5). But every
+capacity threshold inflated by roughly 35-80x, so the main cause is that
+the load-test firehose is far out of distribution (median gap between
+transactions 315 s vs 1,840 s in training), and a supervised model
+extrapolates much more aggressively than the unsupervised one. No threshold
+fixes that. The fix belongs in monitoring: the PSI drift job already flags
+this traffic, and it should drive an alert-volume circuit breaker. Written
+into the README as the first thing to add; **not built**.
+
+Also noted: rule counts varied a lot between runs (e.g. `IMPOSSIBLE_TRAVEL`
+673 vs ~190) because I replayed the same seeded traffic several times and
+each customer's rolling state kept accumulating. Alert *counts* across
+runs aren't comparable for that reason; the identical-rows table above is
+the fair comparison.
+
+### 4. Demo GIF: not regenerated
+Recording started (live feed with alerts arriving, the drill-down, the
+expanded z-score section). Chrome screenshots then started timing out
+intermittently on the detail page while the map iframe was rendering, and
+then the browser extension disconnected. Rather than keep retrying,
+**the old GIF is kept** and the README now says it predates SHAP, with the
+live-stack waterfall screenshot (`docs/shap-waterfall.jpg`) directly under
+it. The re-record is still to do.
+
+### 5. README
+- Intro, Status (Phase 3 bullet, with a link to this log), architecture
+  diagram (LightGBM champion, TreeSHAP per alert, Isolation Forest shadow,
+  SHAP waterfall in the console), repository layout (`explain_report.py`,
+  migrations, test counts 44 / 31), and getting-started text (both
+  thresholds, the SHAP report, the new drill-down).
+- **Detection section rewritten:** champion/shadow design and severity
+  rule; a side-by-side metrics table (LightGBM vs Isolation Forest at the
+  capacity threshold); the per-pattern table with LightGBM columns; and
+  honest notes (precision went *down*, and why; the one-tree
+  `scale_pos_weight` model; NaN handling; leakage).
+- **New:** the identical-rows alert-volume table and the circuit-breaker
+  recommendation; the migration approach in the alert-service section; the
+  charting note (waterfall, colour meaning).
+- **Latency section:** the original numbers kept, plus the A/B table and
+  the OpenMP finding.
+- Only these sections were committed. The README's other uncommitted
+  edits (streaming, exactly-once, 100x sections) stay unstaged in the
+  working tree, byte for byte as they were.
+
+### Cleanup
+The stack was stopped, both temporary worktrees removed, and the temporary
+image tags deleted. The dev database keeps everything the live runs wrote:
+120,584 alerts in total, of which 11,352 are new SHAP alerts and 1,640 are
+old-format alerts from the Isolation Forest A/B run. Those 1,640 are a
+useful side result: the *new* alert service ingested genuine old-format
+messages from the old Spark image with no errors, which is the
+backward-compatibility path from Phase 3 working for real, not just in a
+unit test.
+
+---
+
+## Acceptance checklist (from the spec)
+
+- [x] LightGBM drives live alerts; Isolation Forest scores in shadow
+- [x] Threshold recalibrated to analyst capacity; new metrics recorded in `metrics.json` and the README
+- [x] SHAP additivity test passes; the NaN test passes
+- [x] Console shows the SHAP waterfall, and old alerts still render
+- [x] Offline SHAP report + plots generated
+- [x] All existing tests still pass; latency re-measured (and a 3x regression found and fixed)
+- [ ] Demo GIF regenerated: **not done** (browser extension disconnected); a live-stack screenshot stands in
+
+## Resume line, with the real numbers
+
+> "Served a LightGBM fraud model (PR-AUC 0.906) as champion with an
+> Isolation Forest in shadow mode, with per-alert TreeSHAP explanations
+> (independently verified to 1e-14) rendered as waterfall charts in the
+> analyst console; recalibrated the alert threshold to analyst capacity,
+> raising recall from 0.919 to 0.968 on the same 200-alert/day budget, and
+> found and fixed a 3x end-to-end latency regression caused by OpenMP
+> oversubscription inside Spark."
+
+The spec's template line ("raising hybrid precision from 0.040 to X") can't
+be used honestly: hybrid precision went to 0.036, because at 200 alerts/day
+for ~12 frauds/day precision is capped near 6% for any model. The
+improvement is in recall, and in precision at a right-sized budget (0.71 vs
+0.52 at 15/day).

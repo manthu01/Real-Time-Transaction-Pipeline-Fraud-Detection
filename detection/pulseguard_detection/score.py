@@ -47,6 +47,16 @@ UNUSUAL_FEATURES_COUNT = 3
 # probability, so "the model thinks fraud is more likely than not" is a
 # meaningful, threshold-independent line.
 HIGH_SEVERITY_PROBABILITY = 0.5
+# LightGBM's predict defaults to one OpenMP thread per core, and its idle
+# threads spin rather than sleep. Inside Spark that's the wrong default:
+# every Python worker process scoring a batch spins up a full thread team
+# (12 here, the host's core count) next to the JVM and the other
+# queries' workers on a 2-core `local[2]` budget. Measured on the live
+# stack at 20 tx/s: end-to-end p50 33.6s with the default vs 14.3s with
+# one thread (Isolation Forest baseline 12.2s). Batches here are a few
+# hundred rows -- far too small for intra-batch threading to pay off --
+# and Spark already parallelises across partitions.
+PREDICT_THREADS = 1
 
 
 @dataclass
@@ -206,7 +216,7 @@ def score_batch(artifacts: DetectionArtifacts, feature_rows: list[dict[str, Any]
     if not feature_rows:
         return []
     X = feature_matrix(artifacts, feature_rows)
-    probabilities = artifacts.lgbm_model.predict(X)
+    probabilities = artifacts.lgbm_model.predict(X, num_threads=PREDICT_THREADS)
     fired_per_row = []
     for features, raw in zip(feature_rows, raws):
         context = {**{name: features.get(name) for name in artifacts.feature_names}, "amount": raw["amount"], "deviceIsNew": bool(raw.get("deviceIsNew"))}
@@ -220,7 +230,7 @@ def score_batch(artifacts: DetectionArtifacts, feature_rows: list[dict[str, Any]
     # explanations and the shadow score only for rows that alert -- most
     # transactions don't, and TreeSHAP is the expensive call here.
     X_alerted = X[alerted]
-    contribs = artifacts.lgbm_model.predict(X_alerted, pred_contrib=True)
+    contribs = artifacts.lgbm_model.predict(X_alerted, pred_contrib=True, num_threads=PREDICT_THREADS)
     iso_scores = anomaly_scores(artifacts, X_alerted)
     for row_idx, i in enumerate(alerted):
         p = float(probabilities[i])

@@ -44,7 +44,7 @@ class _FakeBooster:
     def feature_name(self):
         return list(FEATURE_NAMES)
 
-    def predict(self, X, pred_contrib=False, raw_score=False):
+    def predict(self, X, pred_contrib=False, raw_score=False, **params):
         n = len(X)
         logit = math.log(self._p / (1 - self._p))
         if pred_contrib:

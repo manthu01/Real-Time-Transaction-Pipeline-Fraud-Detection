@@ -1,8 +1,9 @@
 # PulseGuard — Real-Time Transaction Monitoring & Fraud Detection Pipeline
 
 Synthetic UPI, card, and NEFT transactions stream through Kafka, get scored
-for fraud in real time by a hybrid rules + anomaly-model detection layer,
-and surface to an analyst console with per-alert explainability. Analyst
+for fraud in real time by a hybrid rules + LightGBM detection layer (with
+an Isolation Forest scoring every transaction in shadow), and surface to
+an analyst console with an exact per-alert SHAP explanation. Analyst
 decisions feed back into a label store for retraining, and a nightly batch
 layer tracks fraud rate, per-rule precision, and feature drift.
 
@@ -18,7 +19,18 @@ between training and serving so the two never drift apart.
 opening an alert's drill-down (triggered rule, top contributing features,
 map, the customer's other recent alerts), submitting a real disposition
 (note + Confirmed Fraud), and the metrics page updating from it —
-`THRESHOLD_STRUCTURING`'s precision reflects that submission.*
+`THRESHOLD_STRUCTURING`'s precision reflects that submission.* This
+recording predates the LightGBM champion: the drill-down now explains
+the model's score as a SHAP waterfall instead of the z-score bars shown
+here, captured below from the same live stack.
+
+![SHAP waterfall for a live alert](docs/shap-waterfall.jpg)
+
+*A live alert from the running stack: a model-only card-testing catch.
+LightGBM starts from its base value (−10.42 log-odds), four transactions
+in the last minute pushes it +28.55, being in the exact same place as the
+previous transaction another +5.15, and it ends at 24.99 → p = 1.000. The
+Isolation Forest, scoring in shadow, gave it 0.58.*
 
 ## Status
 
@@ -36,10 +48,13 @@ implemented and tested; unchecked items are planned.
       aggregation demo, dead-letter routing for malformed records, and a
       Redis online feature store — verified end-to-end against live Kafka.
 - [x] **Phase 3 — Detection layer.** A safe (no-`eval`) versioned rule
-      engine, an Isolation Forest anomaly model benchmarked against a
-      supervised LightGBM model, an alert threshold calibrated to analyst
-      review capacity, and per-alert explainability — wired live into the
-      Spark job and verified producing real alerts to `fraud.alerts`.
+      engine, a LightGBM champion with an Isolation Forest in shadow, an
+      alert threshold calibrated to analyst review capacity, and exact
+      per-alert TreeSHAP explanations — wired live into the Spark job and
+      verified producing real alerts to `fraud.alerts`. (LightGBM started
+      as an offline benchmark next to an Isolation Forest scorer; the
+      switch to serving it, and everything found along the way, is logged
+      in [`update/LIGHTGBM_SHAP_UPDATES.md`](update/LIGHTGBM_SHAP_UPDATES.md).)
 - **Phase 4 — Serving & analytical layer.**
   - [x] NestJS alert service: consumes `fraud.alerts`, persists idempotently
         to Postgres, broadcasts over WebSocket, serves REST history/detail,
@@ -74,13 +89,15 @@ Transaction Generator (Python, behavioural profiles + injected fraud)
 Kafka topic: raw.transactions
 (partitioned by customerId, 6 partitions)
         │
-   ┌────┴────────────────────────┐
-   │  Spark Structured Streaming │
-   │  ├─ parse + validate        │
-   │  ├─ 26 rolling features     │
-   │  ├─ velocity rule engine    │
-   │  └─ Isolation Forest score  │
-   └────┬─────────────────────────┘
+   ┌────┴───────────────────────────────┐
+   │  Spark Structured Streaming        │
+   │  ├─ parse + validate               │
+   │  ├─ 26 rolling features            │
+   │  ├─ velocity rule engine           │
+   │  ├─ LightGBM p (champion: alerts)  │
+   │  ├─ TreeSHAP per alert             │
+   │  └─ Isolation Forest (shadow)      │
+   └────┬───────────────────────────────┘
         │
   ┌─────┼───────────────┬──────────────────┐
   ▼     ▼               ▼                  ▼
@@ -96,15 +113,15 @@ store     ▼                │
    Next.js analyst       ├─ data quality gates (fail loudly)
    console               └─ retrain-check: challenger vs.
    (live feed,               champion, report only
-   drill-down,
+   drill-down +
+   SHAP waterfall,
    disposition)
          │
    analyst.dispositions (Kafka) → retrain-check     <- Phase 5: real retraining loop
 ```
 
 *Everything above is built and verified against the live stack; see
-Status. Only the load-testing/failure-drill numbers (Phase 5) are still
-outstanding.*
+Status.*
 
 ## Why each piece matters
 
@@ -148,7 +165,7 @@ streaming/          Spark Structured Streaming feature computation job
     redis_writer.py    writes feature vectors to the online feature store
   tests/             17 tests, all Spark-free (pure Python + pandas)
   Dockerfile         apache/spark-py:v3.4.0 + this job's dependencies
-detection/          Hybrid rules + anomaly-model detection layer
+detection/          Hybrid rules + LightGBM detection layer (Isolation Forest in shadow)
   pulseguard_detection/
     rule_engine.py   safe (no `eval`) AST-based expression evaluator
     rules.json       6 versioned velocity rules
@@ -157,13 +174,16 @@ detection/          Hybrid rules + anomaly-model detection layer
                       job uses, so there is one implementation of "what a
                       feature means," not two
     threshold.py     alert threshold selection from analyst capacity
-    train.py         trains + evaluates Isolation Forest and LightGBM,
-                      writes artifacts/ (models, threshold, metrics, chart)
-    score.py         the live scoring function: rules + model + explainability
+    train.py         trains + evaluates LightGBM and the Isolation Forest,
+                      a capacity threshold per model; writes artifacts/
+    score.py         the live scoring function: rules + LightGBM + TreeSHAP,
+                      Isolation Forest shadow score, batched per pandas batch
+    explain_report.py  offline SHAP report: independent TreeSHAP cross-check,
+                      importance + beeswarm plots
   artifacts/         trained models + evaluation evidence (gitignored
                       except metrics.json/threshold_tradeoff.*/threshold.json/
                       feature_names.json -- see Getting started)
-  tests/             34 tests, no Spark/Kafka/trained-model required
+  tests/             44 tests, no Spark/Kafka/trained-model required
 serving/
   alert-service/     NestJS: consumes fraud.alerts, serves the REST/WebSocket
                       API the analyst console uses
@@ -173,10 +193,12 @@ serving/
                         separate modules to avoid a circular dependency
     src/metrics/       alerts/day, per-rule precision, mean time to
                         disposition, false-positive-rate trend
-    *.spec.ts          22 tests (mocked repository, no live Postgres/Kafka)
+    src/migrations/    TypeORM migrations, run at startup (replaced `synchronize`)
+    *.spec.ts          31 tests (mocked repository, no live Postgres/Kafka)
   analyst-console/   Next.js: live feed, drill-down, disposition capture
     src/app/           live feed (/), drill-down (/alerts/[alertId]), metrics
-    src/components/    severity/disposition badges, hand-rolled feature bars,
+    src/components/    severity/disposition badges, hand-rolled SHAP waterfall
+                        and z-score bars,
                         an OpenStreetMap iframe embed, the disposition form
     src/lib/           REST client, a shared socket.io singleton, shared types
 analytics/          Nightly batch job: bronze reads, gold, PSI, quality, retrain-check
@@ -289,9 +311,12 @@ pip install -r requirements.txt
 python -m pulseguard_detection.train --input-jsonl data/training_raw.jsonl
 ```
 
-This writes `detection/artifacts/`: the trained Isolation Forest and
-LightGBM models, the calibrated threshold, the alerts/day-vs-fraud-caught
-trade-off chart, and `metrics.json` with every number in the section below.
+This writes `detection/artifacts/`: the trained LightGBM and Isolation
+Forest models, both capacity-calibrated thresholds (`threshold.json`), the
+alerts/day-vs-fraud-caught trade-off chart, and `metrics.json` with every
+number in the section below. `python -m pulseguard_detection.explain_report
+--input-jsonl data/training_raw.jsonl` then writes the SHAP plots (needs
+the trained model; offline only).
 `docker-compose.yml` bind-mounts `detection/artifacts/` into the Spark
 container read-only — restart it (`docker compose restart
 spark-feature-job`) after training to pick up a newly-trained model. If
@@ -337,9 +362,12 @@ retraining pipeline would consume from.
 - **Live Feed** (`/`) — alerts streaming in over WebSocket, newest first,
   colour-coded by severity, filterable, click through to any alert.
 - **Drill-down** (`/alerts/<alertId>`) — the transaction, which rules
-  fired (or "flagged by the anomaly model alone"), the top 3 contributing
-  features as bar charts, an OpenStreetMap embed of where it happened, the
-  customer's other recent alerts, and the disposition form.
+  fired (or "flagged by the LightGBM model alone"), the model's p with the
+  Isolation Forest's shadow score beside it, a SHAP waterfall of why the
+  model scored it that way, a collapsed "statistically unusual" z-score
+  view, an OpenStreetMap embed of where it happened, the customer's other
+  recent alerts, and the disposition form. Alerts from before the LightGBM
+  switch still render, with their original z-score view.
 - **Metrics** (`/metrics`) — the same alerts/day, per-rule precision, mean
   time to disposition, and false-positive-rate trend the API exposes.
 
@@ -480,90 +508,108 @@ feature names this pipeline actually computes (e.g. `CARD_TESTING` checks
 combination, since a single bounded event-history buffer already gives an
 exact burst count).
 
+**Champion and shadow.** LightGBM is the champion: an alert fires when a
+rule fires **or** its fraud probability clears the capacity threshold. The
+Isolation Forest scores every alerted transaction too but never triggers
+one. It's kept in shadow because it's the only detector that needs no
+labels, so it's the one that can still notice a fraud pattern nobody has
+labelled yet. Its score sits beside LightGBM's in the console, so it's
+visible when the two disagree. Severity is the most severe of the fired
+rules' configured severities and HIGH when p ≥ 0.5. A rule can raise an
+alert's severity but can't pull a confident model's alert down. (The first
+version let any fired rule override the model, which left a p = 1.000 fraud
+that also tripped a MEDIUM rule rated MEDIUM; real alerts exposed that.)
+
 **Real numbers, measured on a 2000-customer/21-day synthetic dataset**
 (187,959 transactions, 333 labelled fraud, time-based 75/25 train/holdout
-split so nothing evaluates on data from before it was "trained"):
+split so nothing evaluates on data from before it was "trained"). Each
+model gets its own threshold from the same capacity: 5 analysts × 40
+reviews/day = 200 alerts/day = 2.21% of holdout volume.
 
-| Metric | Value |
-|---|---|
-| Isolation Forest PR-AUC (unsupervised, holdout) | 0.457 |
-| LightGBM PR-AUC (supervised benchmark, holdout) | 0.864 |
-| Rules-only: precision / recall / alert rate | 0.082 / 0.823 / 1.33% |
-| Alert threshold, calibrated to 5 analysts × 40 reviews/day | 200 alerts/day → 2.21% alert rate |
-| Model-only at that threshold: precision / recall | 0.055 / 0.919 |
-| Hybrid (rules OR model≥threshold): precision / recall / alert rate | 0.040 / 0.919 / 3.02% |
-| False-positive rate at matched recall (0.919): model-only vs hybrid | 1.46% vs 2.90% |
+| Metric (holdout, at the capacity threshold) | LightGBM (champion) | Isolation Forest (shadow) |
+|---|---|---|
+| PR-AUC | **0.906** | 0.457 |
+| Threshold | p ≥ 3.3e-5 | score ≥ 0.540 |
+| Model-only precision / recall / alert rate | 0.050 / **0.968** / 2.56% | 0.055 / 0.919 / 2.22% |
+| Hybrid (rules OR model) precision / recall / alert rate | 0.036 / **0.968** / 3.52% | 0.040 / 0.919 / 3.02% |
+| FPR at matched recall: model-only vs hybrid | 1.20% vs 3.40% | 1.46% vs 2.90% |
 
-![Alerts/day vs fraud caught](detection/artifacts/threshold_tradeoff.png)
+Rules alone: precision 0.082, recall 0.823, alert rate 1.33%.
 
-**Detection rate per injected fraud pattern**, on the same holdout
-(hybrid = rules OR model≥threshold; each pattern's `n` is how many holdout
-rows carry that label — small by construction, since only ~0.3% of
-generated volume is fraud in the first place):
+![Alerts/day vs fraud caught, both models](detection/artifacts/threshold_tradeoff.png)
 
-| Fraud pattern | n (holdout) | Rules-only recall | Hybrid recall |
-|---|---|---|---|
-| CARD_TESTING | 31 | 0.936 | 1.000 |
-| MULE_ACCOUNT | 16 | 0.875 | 1.000 |
-| SALAMI_SLICING | 7 | 0.286 | 0.571 |
-| GEO_IMPOSSIBLE_TRAVEL | 4 | 0.500 | 0.500 |
-| ACCOUNT_TAKEOVER | 2 | 1.000 | 1.000 |
-| MERCHANT_CATEGORY_ANOMALY | 2 | 1.000 | 1.000 |
+**Detection rate per injected fraud pattern**, on the same holdout (each
+pattern's `n` is how many holdout rows carry that label: small by
+construction, since only ~0.3% of generated volume is fraud):
 
-Two things worth saying about this table rather than just the numbers:
-the model closes real gaps the rules leave open on the higher-volume
-patterns (SALAMI_SLICING goes from catching 2 of 7 to 4 of 7; MULE_ACCOUNT
-and CARD_TESTING both reach 100% once the anomaly score backs up the
-rules), and GEO_IMPOSSIBLE_TRAVEL is the one pattern neither layer fully
-closes — with only 4 holdout examples, "50% recall" is one missed
-transaction, not a statistically meaningful weakness, but it's also not
-something to round up to a stronger claim than the data supports. The
-`ACCOUNT_TAKEOVER`/`MERCHANT_CATEGORY_ANOMALY` rows (n=2 each) are too
-small to draw any conclusion from at all beyond "both examples happened to
-be caught" — they're reported because the build plan asks for detection
-rate per pattern, not because n=2 tells you anything a bank would act on.
+| Fraud pattern | n | Rules only | IF hybrid | LightGBM only | LightGBM hybrid |
+|---|---|---|---|---|---|
+| CARD_TESTING | 31 | 0.935 | 1.000 | 1.000 | 1.000 |
+| MULE_ACCOUNT | 16 | 0.875 | 1.000 | 1.000 | 1.000 |
+| SALAMI_SLICING | 7 | 0.286 | 0.571 | **0.714** | **0.714** |
+| GEO_IMPOSSIBLE_TRAVEL | 4 | 0.500 | 0.500 | **1.000** | **1.000** |
+| ACCOUNT_TAKEOVER | 2 | 1.000 | 1.000 | 1.000 | 1.000 |
+| MERCHANT_CATEGORY_ANOMALY | 2 | 1.000 | 1.000 | 1.000 | 1.000 |
 
-A few things worth saying honestly about these numbers rather than letting
-them stand alone:
+LightGBM closes the two gaps the Isolation Forest hybrid left open
+(impossible travel 2/4 → 4/4, salami slicing 4/7 → 5/7). With n = 4 and
+n = 7 those are one or two transactions each, real but thin evidence. The
+n = 2 rows say nothing beyond "both examples were caught".
 
-- **LightGBM's PR-AUC (0.864) is high because the injected fraud patterns
-  are, by construction, extreme outliers** — an account takeover is 8-15x
-  a customer's trailing mean at 2-4AM; that's an easy signal for a
-  supervised model once it has labels. `best_iteration_: 1` (found via
-  early stopping against a validation split carved from the *training*
-  set, never the holdout) means a single boosting round already separates
-  the classes about as well as 1000 would — more rounds overfit the ~250
-  training examples of the minority class. This is a real, measured
-  finding, not a hyperparameter picked because it flattered the holdout
-  score.
-- **The Isolation Forest's lower PR-AUC (0.457) is the expected cost of
-  going unsupervised** — it has no labels to learn from and has to decide
-  what's anomalous purely from the shape of normal behaviour. That gap
-  *is* the answer to "what do you give up going unsupervised," and it's
-  why the rules exist alongside it: rules give zero-latency, fully
-  explainable coverage of the known patterns the unsupervised model is
-  weakest on.
-- **This retrain's honest surprise: at matched recall (0.919), the hybrid
-  system's false-positive rate (2.90%) is *worse* than the model alone
-  (1.46%), not better.** The model-only comparison sweeps every possible
-  threshold to find the cheapest way to reach that recall; the hybrid
-  number is rules-OR-model at the threshold actually deployed, and here
-  the rules add alerts (they're the low-precision 0.082 layer from the
-  table above) without adding recall the model didn't already have on its
-  own at that operating point — so this retrain, ORing them in is pure
-  false-positive cost, not a net win. That's a real result, not the one an
-  earlier run of this same pipeline produced (which found the opposite),
-  and the honest takeaway is that whether rules-alongside-a-model help or
-  hurt precision at a given recall depends on how much incremental recall
-  they're actually contributing that day — worth checking per retrain, not
-  something to assume permanently holds in either direction. The reason to
-  keep rules at all is unchanged: zero-latency, fully explainable coverage
-  that keeps working when the model is down or retraining, independent of
-  whether they help or hurt the blended precision number this week.
+Things worth saying about these numbers rather than letting them stand
+alone:
+
+- **Hybrid precision went *down* (0.040 → 0.036), not up.** I'd expected
+  the better model to raise it a lot. It can't at this operating point:
+  the holdout has ~12 frauds/day, so filling 200 review slots caps even a
+  perfect model at ~6% precision. To fill those slots, the LightGBM
+  threshold falls to p = 3.3e-5, barely above the model's own base rate
+  (3.0e-5). LightGBM's real gain here is recall (0.919 → 0.968: three more
+  frauds caught out of 62 on the same budget), and its advantage shows at a
+  budget sized to the fraud volume: at 15 alerts/day, LightGBM alone gets
+  precision **0.71** at recall 0.90, against the Isolation Forest's 0.52 at
+  0.66. The 200/day default is kept so every number stays comparable with
+  the Isolation Forest era. The real takeaway is that the review team is
+  over-provisioned for this fraud volume.
+- **LightGBM is high partly because the injected patterns are learnable by
+  construction.** An account takeover is 8-15x a customer's trailing mean
+  at 2-4AM: an easy signal for a supervised model with labels. The
+  time-based split is kept (nothing is evaluated on data from before
+  training), early stopping uses a validation split carved from the
+  *training* set (83 rounds), and the SHAP plots below show concretely
+  where the model is keying on the simulator rather than on fraud. Treat
+  0.906 as an upper bound for this setup, not a real-world number.
+- **An earlier version of this model was one tree with 7 possible
+  outputs.** With `scale_pos_weight ≈ 560` (n_neg/n_pos), early stopping
+  kept a single boosting round whose fraud leaves already sat at p ≈ 1.0.
+  PR-AUC still looked fine (0.864, rank-based), but a capacity threshold
+  over 7 distinct values can only mean "alert on almost nothing" or "alert
+  on everything", and it picked everything (100% alert rate). Dropping the
+  reweighting changed nothing in validation PR-AUC and gave a real model:
+  83 rounds, ~1,400 distinct scores, and a p that is an actual probability
+  (which the severity rule and the console both rely on). `train.py` now
+  warns when a threshold overshoots its capacity target by more than 2x,
+  so that failure can't be silent again.
+- **Missing values reach LightGBM as NaN, in training and live.** The main
+  one is `secondsSincePrevTxn` on a customer's first transaction. Filling
+  it with 0.0 would claim "zero seconds since the previous transaction",
+  which is exactly the card-testing signature. LightGBM learns a default
+  direction for missing values at each split. The Isolation Forest (which
+  sklearn won't give NaN) still gets zeros.
+- **The Isolation Forest's 0.457 is the cost of going unsupervised**, and
+  it's why it's in shadow rather than retired: on a pattern with no labels
+  yet, it's the only model that has a chance.
+- **At matched recall, adding the rules still costs false positives**
+  (LightGBM 1.20% → 3.40%) because the rules add alerts without adding
+  recall the model doesn't already have at this operating point. That was
+  true for the Isolation Forest too, and it's worth re-checking per
+  retrain. The reason to keep rules is unchanged: zero-latency, fully
+  explainable coverage that keeps working when the model is down or
+  retraining.
 - **These are demo-scale numbers, not bank-scale ones.** The holdout spans
   5.2 days at ~9,036 txns/day; the build plan's own worked example assumes
-  4M txns/day. The *mechanism* — calibrate to review capacity, don't pick
-  F1-optimal — is what transfers, not the literal alert-rate percentage.
+  4M txns/day. The *mechanism* (calibrate to review capacity, don't pick
+  F1-optimal) is what transfers, not the literal alert-rate percentage.
 
 **Explainability, mechanically.** Every alert carries an exact per-alert
 SHAP explanation from the LightGBM champion: `score.py` reads TreeSHAP
@@ -640,6 +686,35 @@ scoring code — and exactly the kind of thing PSI drift monitoring (Phase 4)
 is meant to surface automatically instead of requiring someone to notice it
 in the logs.
 
+**The same observation got sharper with LightGBM, and it's the strongest
+argument for the shadow model and drift monitoring.** On load-test traffic
+at the normal 0.3% fraud rate, the LightGBM pipeline alerted on far more
+transactions than the Isolation Forest one. To rule out a bug in the Spark
+path, the exact feature rows Spark wrote to bronze were rescored offline:
+3,008 of 3,009 live alert scores matched exactly. (The one that didn't had a
+mismatched Isolation Forest score too, so its feature row differed between
+two queries' separate state stores; that's the three-consumers design
+below, not the scorer.) On those identical 8,249 rows:
+
+| Detector at its capacity threshold | Load-test rows flagged | Holdout alert rate it was calibrated to |
+|---|---|---|
+| Rules | 9.3% | 1.33% |
+| Isolation Forest (score ≥ 0.540) | 35.2% | 2.22% |
+| LightGBM (p ≥ 3.3e-5) | **79.9%** | 2.56% |
+| LightGBM, but with a 15/day threshold (p ≥ 0.011) | 13.5% | 0.17% |
+
+The firehose is far outside the training distribution (median gap between a
+customer's transactions 315 s vs 1,840 s in training). A supervised model
+extrapolates on out-of-distribution data much more aggressively than the
+unsupervised one, and every capacity threshold inflated by roughly 35-80x,
+so no threshold choice fixes it. The 200/day threshold sitting near the
+base rate makes it worse in absolute terms. What a real deployment needs
+here isn't a different threshold: it's the PSI drift monitor (which already
+flags this traffic) feeding an alert-volume circuit breaker, so a model
+suddenly alerting at 30x its calibrated rate gets flagged as broken input
+rather than read as a fraud wave. That breaker isn't built; it's the first
+thing I'd add.
+
 ## The alert service, in more detail
 
 **Idempotent ingestion, on purpose.** The alert entity's primary key is
@@ -693,6 +768,19 @@ history isn't: this service can offer a customer's other *alerts*
 non-alerted transactions too, which needs a queryable transaction store --
 the Delta Lake bronze layer's job, still planned.
 
+**Schema changes go through migrations, not `synchronize`.** The service
+originally ran TypeORM with `synchronize: true`. Adding the SHAP columns
+switched it to real migrations (`src/migrations/`, run at startup). The
+baseline migration reproduces what `synchronize` had created statement for
+statement, including TypeORM's generated index names, all `IF NOT EXISTS`.
+Hand-picked index names would have quietly added a second copy of every
+index on existing databases. A second migration adds the nullable SHAP
+columns, without back-fill. Verified against a database built by the old
+code, a fresh one, and this project's real dev database (107,592 alerts):
+TypeORM's own schema diff against the entity comes out empty in each case,
+and every row is kept. New Kafka fields are optional in the wire contract,
+because `fraud.alerts` keeps 30 days of older messages.
+
 ## The analyst console, in more detail
 
 **Next.js pinned to 15.x, not 14.x.** `npm audit` flagged Next 14.2.5's
@@ -704,10 +792,15 @@ a build-time-only code path that never processes attacker-controlled CSS
 in this project (`globals.css` is static and developer-authored), so it's
 accepted rather than chased into a major-version migration.
 
-**No charting library, on purpose.** Three bars showing top feature
-z-scores, and a handful of stat tiles and a sparkline on the metrics page,
-don't need Recharts or D3 -- `TopFeaturesBars` and the metrics
-sparkline are a few dozen lines of divs scaled by percentage width/height.
+**No charting library, on purpose.** A SHAP waterfall of six bars, the
+z-score bars, and a handful of stat tiles and a sparkline on the metrics
+page don't need Recharts or D3 -- `ShapWaterfall`, `ZScoreBars` and the
+metrics sparkline are a few dozen lines of divs positioned by percentage.
+The waterfall puts every bar on one shared log-odds axis and adds an "all
+other features" remainder, so it always adds up exactly to the model's
+output. Red means toward fraud and blue away from it, so the z-score bars
+are deliberately neutral grey: a z-score has no direction of
+"fraudiness", only distance from normal.
 "Functional over beautiful" cuts both ways: it also means not reaching for
 machinery a raw `<div style={{width: pct+'%'}}>` already does.
 
@@ -841,7 +934,7 @@ free to skip.
 Measured as `alertPublishTime - transactionTimestamp` from a Kafka
 consumer probe reading `fraud.alerts` directly (its own consumer group,
 `auto.offset.reset=latest`, so it only sees new alerts, not backlog
-replay):
+replay). The original Isolation Forest pipeline:
 
 | Percentile | Latency |
 |---|---|
@@ -854,6 +947,35 @@ Ten-plus seconds of median latency at a rate the pipeline can't actually
 sustain is the expected shape of a growing backlog, not a flat processing
 cost -- it's the same underlying finding as the throughput numbers above,
 seen from the consumer's side instead of the producer's side.
+
+**Re-measured after switching to LightGBM + SHAP, as a same-day A/B.**
+Comparing against a number recorded weeks earlier under different machine
+load wouldn't be fair, so both images ran back to back on the same stack,
+with the same 180 s of seeded load-test traffic, each starting only once the
+pipeline had fully drained (alerts-query checkpoint equal to the topic's end
+offset):
+
+| Spark image | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| Isolation Forest (before) | 12.2 s | 17.5 s | 18.9 s | 20.2 s |
+| LightGBM + TreeSHAP, LightGBM's default threading | 33.6 s | 57.7 s | 64.6 s | 68.1 s |
+| LightGBM + TreeSHAP, `predict(num_threads=1)` (shipped) | **13.9 s** | 21.2 s | 23.2 s | 25.7 s |
+
+The first LightGBM run was ~3x slower, which made no sense: offline, the
+entire scoring path (rules, LightGBM, SHAP, shadow score) costs ~160 µs per
+transaction, under a second for the whole run, and every query slowed down,
+not just the alerts one. The cause was **OpenMP oversubscription**.
+LightGBM's `predict` defaults to one OpenMP thread per core, and its idle
+threads spin rather than sleep. Inside the container that meant each Python
+worker scoring a batch started a 12-thread team (the host's core count) next
+to the JVM and the other queries' workers, on a `local[2]` budget. Rerunning
+the same image with `OMP_NUM_THREADS=1` confirmed it (p50 14.3 s, no code
+change). The shipped fix is in code, `score.py`'s `PREDICT_THREADS = 1`, so
+it holds in any Spark deployment rather than depending on a container env
+var. The remaining ~1.7 s at p50 comes with ~2.9x as many alerts in that run,
+each paying for TreeSHAP and a Kafka write (see the alert-volume finding in
+the detection section). The latency regression is fixed; the alert volume
+on out-of-distribution traffic is the open problem.
 
 ### A real bug the load test itself was built on: the generator's own rate limiter
 
