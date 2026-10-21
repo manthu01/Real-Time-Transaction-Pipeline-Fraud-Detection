@@ -1157,6 +1157,20 @@ exactly-once" rather than transactionally guaranteed:
   write API is designed for is now handled by configuration, not just by
   having gotten lucky in one test run," not a re-run proof against the
   same abrupt kill with this option enabled.
+
+  **One measured exception: the switch to the new writer itself.** The
+  first run after the switch showed 50 duplicate bronze rows
+  (134,328 rows, 134,278 distinct `txnId`s), all from a single
+  25-second window. The cause is in the Delta log. The old plain sink
+  had committed batch 2975 under *its* `txnAppId` (the streaming query's
+  UUID), and the stack was stopped before Spark's checkpoint recorded that
+  batch as done. On restart, the new `foreachBatch` writer replayed batch
+  2975 under `pulseguard-bronze-writer`, a key Delta had never seen, so it
+  couldn't recognise the batch as already written. In other words, the
+  idempotency key only protects replays under the same key, so switching
+  keys on a live checkpoint opens a one-batch window. Every commit
+  after that one is keyed correctly and added no duplicates in the
+  verification run.
 - **The `fraud.alerts` and `dead.letter` Kafka sinks are at-least-once**,
   not exactly-once, at the write level -- Spark's plain Kafka sink isn't
   wrapped in a transactional producer the way the Delta sink gets atomic
