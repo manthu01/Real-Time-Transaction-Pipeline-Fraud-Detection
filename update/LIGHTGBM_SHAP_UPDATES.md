@@ -171,7 +171,8 @@ budget would buy.
   (LightGBM is the champion). Out of the spec's scope; left as-is.
   *(Resolved in the follow-up at the end: it now checks both models.)*
 - scikit-learn version mismatch (1.7.2 local vs 1.5.2 in the image) for the
-  IF pickle — pre-existing. *(Still open; see the follow-up.)*
+  IF pickle — pre-existing. *(Resolved at the end of the follow-up, with
+  identical metrics.)*
 - LightGBM 4.7 prints a deprecation warning for `eval_set=` in `fit()`;
   harmless, left alone. *(Resolved in the follow-up.)*
 
@@ -868,7 +869,7 @@ Verified equivalent: the same data fitted both ways gives the same best
 iteration and a maximum prediction difference of 0.0, so no retrain was
 needed. Tests now pass with `-W error::DeprecationWarning`.
 
-### 5. Still open, on purpose: the scikit-learn pickle version
+### 5. The scikit-learn pickle version
 The Isolation Forest is pickled with scikit-learn 1.7.2 (the local
 version) while the Spark image pins 1.5.2, which logs an
 `InconsistentVersionWarning` at load. This predates this work (the
@@ -878,5 +879,23 @@ every live run here, and fixing it properly means retraining in a
 metrics this whole log compares against. The right moment for that is the
 next deliberate retrain, not a clean-up pass.
 
+**Resolved afterwards, without changing a single metric.** The full
+`train.py` run was repeated in a clean venv with exactly the pinned
+`detection/requirements.txt` versions (scikit-learn 1.5.2, LightGBM 4.7.0),
+into a scratch directory, and compared with the committed artifacts:
+- `metrics.json`, `threshold.json`, `threshold_tradeoff.csv` and
+  `lightgbm.txt` came out **byte-identical**.
+- The new `isolation_forest.joblib` loads under 1.5.2 with **no warnings**,
+  and scores all 187,959 transactions with a **maximum difference of 0.0**
+  from the old pickle.
+
+So the retrain changed only the version stamp inside the pickle, and the
+new file replaced the old one. (`*.joblib` is gitignored, so this shows up
+as no repo diff; the next image build copies the new file in.) The
+underlying cause was the host Python having scikit-learn 1.7.2 installed
+instead of the version `requirements.txt` pins. Training from a venv built
+from that file avoids it.
+
 ### Tests after the follow-up
-detection 45, streaming 21, analytics 25 (91 total), alert-service 31.
+detection 45, streaming 21, analytics 25 (91 total), alert-service 31
+(re-run after the follow-up: 31 passed).
