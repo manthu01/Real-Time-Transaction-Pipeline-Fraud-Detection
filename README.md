@@ -104,7 +104,7 @@ online  fraud.alerts   (26 features +     dead.letter
 feature   │             labels, by date)
 store     ▼                │
        NestJS alert         ▼
-       service         Nightly batch job (cron-triggered script)
+       service         Nightly batch job (run on demand)
          │              ├─ gold: fraud rate, risk profiles,
      WebSocket          │   per-rule precision, alert funnel
          │              ├─ PSI drift vs. reference window
@@ -115,7 +115,7 @@ store     ▼                │
    SHAP waterfall,
    disposition)
          │
-   analyst.dispositions (Kafka) → retrain-check     <- Phase 5: real retraining loop
+   analyst.dispositions (Kafka, compacted label store; not yet read by retrain-check)
 ```
 
 *Everything above is built and verified against the live stack; see
@@ -207,8 +207,8 @@ analytics/          Nightly batch job: bronze reads, gold, PSI, quality, retrain
                           alert funnel, from bronze Delta + a batch Kafka read
     retrain_check.py     challenger vs. champion, reusing pulseguard_detection's
                           already-tested training functions -- report only
-    nightly_job.py        the 5-step orchestrator (a
-                           cron-triggered Python script in place of Airflow)
+    nightly_job.py        the 5-step orchestrator (a plain
+                           Python script in place of Airflow, run on demand)
   tests/              24 tests, all Spark-free (pure Python + pandas)
 infra/
   kafka/create_topics.sh   topic provisioning (partitions/retention)
@@ -477,10 +477,14 @@ old by wall-clock time, exactly like the "load-test traffic looks
 anomalous" finding in the detection layer section above. It is not a
 99.8% real-world late-arrival rate; it is what a processing-time proxy
 necessarily reports the first time it's pointed at a topic full of
-historical data. Going forward, with the query caught up to the topic's
-tip (confirmed: its checkpoint already matches the topic's end offsets
-exactly), new production traffic paced close to real time would produce a
-late rate reflecting genuine transaction-to-processing delay instead.
+historical data. With the query caught up to the topic's tip (confirmed:
+its checkpoint already matches the topic's end offsets exactly), the clean
+measurement is the one taken against new traffic only: 301 transactions
+sent at 5 tx/s, paced in real time, and `late.events` grew by **0**, a
+**0% late-event rate**. That's the expected result for traffic produced
+and processed on the same machine with no network or device delay; real
+mobile traffic would push it above zero, and this topic is where that
+number would show up.
 
 **One state object, not a dozen counters.** Each customer's state is a
 bounded event-history buffer (pruned to 7 days, hard-capped at 3000 events
