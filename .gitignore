@@ -48,3 +48,9 @@ analytics/output/*.json
 .idea/
 .vscode/
 *.swp
+
+# Local working notes (not published)
+*_SPEC.md
+update/
+CLAUDE.md
+AGENTS.md
