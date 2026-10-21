@@ -32,6 +32,7 @@ from pulseguard_streaming.schema import REQUIRED_NON_NULL_FIELDS, TRANSACTION_SC
 from pulseguard_streaming.state_codec import deserialize_state, serialize_state
 
 WATERMARK_DELAY = "2 minutes"
+WATERMARK_DELAY_SECONDS = 120
 STATE_IDLE_TIMEOUT_MS = 10 * 24 * 60 * 60 * 1000  # 10 days of no activity drops the customer's state
 
 
@@ -55,6 +56,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--bronze-path", default="/opt/pulseguard/delta/bronze")
     p.add_argument("--enable-bronze", action="store_true", default=True)
     p.add_argument("--no-bronze", dest="enable_bronze", action="store_false", help="skip the Delta bronze write")
+    p.add_argument("--late-events-topic", default="late.events")
+    p.add_argument("--enable-late-events", action="store_true", default=True)
+    p.add_argument("--no-late-events", dest="enable_late_events", action="store_false", help="skip the late-event side-output query")
     return p.parse_args(argv)
 
 
@@ -140,6 +144,51 @@ def start_window_demo_query(valid_with_watermark: DataFrame, trigger_interval: s
         .option("truncate", "false")
         .outputMode("update")
         .trigger(processingTime=trigger_interval)
+        .start()
+    )
+
+
+def write_late_events(
+    valid: DataFrame, bootstrap_servers: str, late_events_topic: str, checkpoint_dir: str, trigger_interval: str,
+    threshold_seconds: int = WATERMARK_DELAY_SECONDS,
+):
+    """Counts and routes the events the build plan explicitly asks for:
+    'count the drops and expose the number... route dropped events to a
+    side output rather than silently discarding them.' Spark's own
+    watermark value isn't queryable from user code, and this project's
+    main feature path deliberately never drops late events at all (see
+    'the streaming feature job, in more detail' in the README) -- only the
+    window-demo aggregation query actually would. So this uses a
+    processing-time proxy applied to the whole stream instead of trying to
+    reach into that one query's internal state: an event is "late" once
+    wall-clock processing time has moved more than `threshold_seconds`
+    past its own transaction timestamp, the same delay the window-demo
+    query uses as its watermark. That's an honest approximation, not an
+    exact replay of Spark's internal watermark computation, and it
+    over-counts slightly relative to the window query specifically (a
+    micro-batch trigger interval of its own adds a little more slack there)
+    -- worth stating plainly rather than presenting this as more precise
+    than it is. This does not remove anything from the main pipeline:
+    late events still flow into `compute_feature_stream` unchanged; this
+    is a read-only side channel for observability.
+
+    Consumers can get the count the same way this project already counts
+    dead.letter in the Phase 5 drills: read topic-end offsets on
+    `late.events`, or consume and count it directly."""
+    late = valid.withColumn(
+        "latenessSeconds", F.unix_timestamp(F.current_timestamp()) - F.unix_timestamp(F.col("timestamp"))
+    ).filter(F.col("latenessSeconds") >= threshold_seconds)
+
+    return (
+        late.selectExpr(
+            "to_json(struct(txnId, customerId, timestamp, latenessSeconds)) AS value"
+        )
+        .writeStream.format("kafka")
+        .option("kafka.bootstrap.servers", bootstrap_servers)
+        .option("topic", late_events_topic)
+        .option("checkpointLocation", f"{checkpoint_dir}/late_events")
+        .trigger(processingTime=trigger_interval)
+        .outputMode("append")
         .start()
     )
 
@@ -235,6 +284,9 @@ def write_features_to_redis(
     )
 
 
+BRONZE_TXN_APP_ID = "pulseguard-bronze-writer"
+
+
 def write_bronze_to_delta(feature_stream: DataFrame, bronze_path: str, checkpoint_dir: str, trigger_interval: str):
     """The bronze layer: the enriched, feature-attached transaction stream
     (raw fields + all 26 features + the isFraud/fraudPattern labels),
@@ -245,15 +297,37 @@ def write_bronze_to_delta(feature_stream: DataFrame, bronze_path: str, checkpoin
     one table. That trade is explicitly sanctioned by the plan's own
     short-on-time cut ("bronze + gold, skip silver"), and here it's the
     nightly analytics job's only read path: per-rule precision, PSI
-    drift, and data-quality checks all read this one table."""
-    bronze = feature_stream.withColumn("date", F.to_date(F.col("timestamp")))
+    drift, and data-quality checks all read this one table.
+
+    Written via foreachBatch with Delta's idempotent-write API
+    (txnAppId/txnVersion=batchId), not the plain streaming Delta sink --
+    the plain sink's atomic-per-batch commit already prevented a *partial*
+    write from ever being visible, but it does nothing to stop a *retried*
+    batch (checkpoint offset advances, then the job crashes before the
+    Delta commit's own completion is durable) from writing the same rows
+    twice on replay. txnVersion=batchId makes that specific retry a no-op:
+    Delta records the last committed version per txnAppId and skips a
+    commit that repeats one already applied. This closes the one named gap
+    in this project's exactly-once story that testing alone couldn't
+    prove -- see 'Exactly-once, precisely' below."""
+
+    def write_batch(batch_df: DataFrame, batch_id: int) -> None:
+        bronze_batch = batch_df.withColumn("date", F.to_date(F.col("timestamp")))
+        (
+            bronze_batch.write.format("delta")
+            .option("txnAppId", BRONZE_TXN_APP_ID)
+            .option("txnVersion", batch_id)
+            .partitionBy("date")
+            .mode("append")
+            .save(bronze_path)
+        )
+
     return (
-        bronze.writeStream.format("delta")
+        feature_stream.writeStream.foreachBatch(write_batch)
         .option("checkpointLocation", f"{checkpoint_dir}/bronze")
-        .partitionBy("date")
         .trigger(processingTime=trigger_interval)
         .outputMode("append")
-        .start(bronze_path)
+        .start()
     )
 
 
@@ -291,6 +365,14 @@ def main(argv: list[str] | None = None) -> None:
     valid_with_watermark = valid.withWatermark("timestamp", WATERMARK_DELAY)
 
     queries = [write_dead_letter(invalid, args.bootstrap_servers, args.dead_letter_topic, args.checkpoint_dir, args.trigger_interval)]
+
+    if args.enable_late_events:
+        # Stateless -- reads `valid` directly, not `feature_stream`, so it
+        # doesn't pay the applyInPandasWithState recomputation cost the
+        # three feature_stream consumers below do.
+        queries.append(
+            write_late_events(valid, args.bootstrap_servers, args.late_events_topic, args.checkpoint_dir, args.trigger_interval)
+        )
 
     if args.enable_window_demo:
         queries.append(start_window_demo_query(valid_with_watermark, args.trigger_interval))

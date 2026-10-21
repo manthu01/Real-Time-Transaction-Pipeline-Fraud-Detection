@@ -446,14 +446,42 @@ does for the `groupBy(customerId, window(...))` demo query — an event
 arriving after the 2-minute mark still updates that customer's rolling
 features. On a real fraud-detection critical path that's the right
 trade-off (a late mobile transaction should still update the customer's
-velocity state, not vanish), but it does mean this project has not built
-the specific mechanism the build plan asks for -- counting watermark drops
-and routing them to a side output -- because on the feature path there is
-nothing to route: nothing gets dropped there. The one place a 2-minute-late
-event is genuinely excluded is the window-demo aggregation, and this
-project does not currently count or expose that number. That is a real,
-named gap against the build plan's explicit ask, not a mechanism that
-exists but goes unmentioned.
+velocity state, not vanish).
+
+**Counting and routing late events, honestly scoped.** The build plan asks
+specifically for this: "count the drops and expose the number... route
+dropped events to a side output rather than silently discarding them."
+Since nothing is actually dropped on the feature path, and Spark's
+internal watermark value isn't queryable from user code to instrument the
+one query (the window demo) that does drop rows, `write_late_events`
+applies a processing-time proxy to the whole stream instead: an event
+counts as late once wall-clock processing time has moved more than 120
+seconds (the same delay as the watermark) past its own transaction
+timestamp, and every such event is routed to a `late.events` Kafka topic
+rather than only being logged and discarded. This is stated as an honest
+approximation, not presented as a byte-for-byte replay of what the
+window-demo query itself excludes — a proxy is what's actually achievable
+without reaching into Spark's internal state, and being clear about that
+distinction is the point, not the specific technique.
+
+**The first real measurement is dominated by a backfill artifact, and
+that's worth explaining rather than quoting the raw number out of
+context.** This query runs from `--starting-offsets earliest`, like every
+other consumer in this job — on its first-ever run (a brand-new
+checkpoint) it read the *entire* `raw.transactions` history in one
+micro-batch, including everything produced during every Phase 5 load
+test, hours before this query existed. `late.events` immediately showed
+111,954 of 112,196 transactions ever produced (99.8%) as "late" — a
+number that looks alarming until you notice it's measuring "how old is
+this record relative to right now," and most of that backlog *is* hours
+old by wall-clock time, exactly like the "load-test traffic looks
+anomalous" finding in the detection layer section above. It is not a
+99.8% real-world late-arrival rate; it is what a processing-time proxy
+necessarily reports the first time it's pointed at a topic full of
+historical data. Going forward, with the query caught up to the topic's
+tip (confirmed: its checkpoint already matches the topic's end offsets
+exactly), new production traffic paced close to real time would produce a
+late rate reflecting genuine transaction-to-processing delay instead.
 
 **One state object, not a dozen counters.** Each customer's state is a
 bounded event-history buffer (pruned to 7 days, hard-capped at 3000 events
@@ -1113,15 +1141,22 @@ exactly-once" rather than transactionally guaranteed:
 - **Delta bronze writes are atomic per micro-batch**, via Delta's
   transaction log -- a batch either fully commits or leaves no partial
   trace, which is what prevents a crash mid-write from leaving bronze in
-  a half-written state. It is *not* configured with Delta's explicit
-  `txnAppId`/`txnVersion` idempotent-write API, which is the piece that
-  would guarantee a *retried* batch (Spark's checkpoint advances the
-  offset, then crashes before recording that this specific batch's Delta
-  write already succeeded) can't double-write. That's a real, named gap,
-  not a hidden one -- the global zero-duplicate result above shows it
-  didn't happen in this project's testing (including one abrupt kill),
-  but "didn't happen in testing" and "can't happen" are different claims,
-  and only the first one is true here today.
+  a half-written state. Bronze is also written with Delta's explicit
+  idempotent-write API (`write_bronze_to_delta` in `feature_job.py`,
+  via `foreachBatch` + `.option("txnAppId", ...).option("txnVersion", batchId)`)
+  specifically to close the gap the atomic-commit property alone doesn't:
+  a *retried* batch (Spark's checkpoint advances the offset, then crashes
+  before recording that this specific batch's Delta write already
+  succeeded) is now a recorded no-op on replay rather than a second write,
+  because Delta tracks the last committed `txnVersion` per `txnAppId` and
+  skips a commit that repeats one already applied. The global
+  zero-duplicate result above was measured *before* this change existed
+  (the driver-kill drill happened first, this was added afterward as the
+  fix for the gap that drill's success couldn't itself close) -- so the
+  honest claim today is "the specific replay scenario Delta's idempotent
+  write API is designed for is now handled by configuration, not just by
+  having gotten lucky in one test run," not a re-run proof against the
+  same abrupt kill with this option enabled.
 - **The `fraud.alerts` and `dead.letter` Kafka sinks are at-least-once**,
   not exactly-once, at the write level -- Spark's plain Kafka sink isn't
   wrapped in a transactional producer the way the Delta sink gets atomic
@@ -1176,14 +1211,12 @@ rather than a fresh list of textbook scaling advice:
   minimum a replica for read failover is the fix; the existing
   degrade-don't-crash behavior in `redis_writer.py` stays exactly as it
   is either way.
-- **Delta bronze isn't configured for idempotent writes or compaction.**
-  The `txnAppId`/`txnVersion` gap documented above matters more at 100x,
-  where a checkpoint-then-crash race is proportionally more likely simply
-  because there are more micro-batches per hour. Separately, continuous
-  small per-batch commits at 100x the write rate will produce a small-file
-  problem Delta's `OPTIMIZE`/compaction exists specifically to solve --
-  this project never needed a compaction job because bronze never got
-  large enough for it to matter, but it would at 100x.
+- **Delta bronze has no compaction job.** Idempotent writes are now
+  configured (`txnAppId`/`txnVersion`, documented above), but continuous
+  small per-batch commits at 100x the write rate will still produce a
+  small-file problem Delta's `OPTIMIZE`/compaction exists specifically to
+  solve -- this project never needed a compaction job because bronze
+  never got large enough for it to matter, but it would at 100x.
 - **The alert service does one Postgres insert per alert and one
   in-process WebSocket broadcast.** That's fine at this project's alert
   volume (a few thousand alerts total across all testing); at 100x traffic

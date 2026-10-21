@@ -39,6 +39,7 @@ create_topic "raw.transactions" 6 "$SEVEN_DAYS_MS"
 create_topic "fraud.alerts" 3 "$THIRTY_DAYS_MS"
 create_topic "dead.letter" 1 "$THIRTY_DAYS_MS"
 create_topic "analyst.dispositions" 1 -1 "--config cleanup.policy=compact"
+create_topic "late.events" 1 "$SEVEN_DAYS_MS"
 
 echo "topics ready:"
 $BIN --bootstrap-server "$BOOTSTRAP" --list
