@@ -1170,7 +1170,10 @@ exactly-once" rather than transactionally guaranteed:
   idempotency key only protects replays under the same key, so switching
   keys on a live checkpoint opens a one-batch window. Every commit
   after that one is keyed correctly and added no duplicates in the
-  verification run.
+  verification run. The 50 copies were confirmed identical, column for
+  column, and removed by rewriting only that day's partition
+  (`replaceWhere`). Bronze is back to 134,278 rows with 134,278 distinct
+  `txnId`s.
 - **The `fraud.alerts` and `dead.letter` Kafka sinks are at-least-once**,
   not exactly-once, at the write level -- Spark's plain Kafka sink isn't
   wrapped in a transactional producer the way the Delta sink gets atomic
