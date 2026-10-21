@@ -51,9 +51,8 @@ implemented and tested; unchecked items are planned.
       alert threshold calibrated to analyst review capacity, and exact
       per-alert TreeSHAP explanations — wired live into the Spark job and
       verified producing real alerts to `fraud.alerts`. (LightGBM started
-      as an offline benchmark next to an Isolation Forest scorer; the
-      switch to serving it, and everything found along the way, is logged
-      in [`update/LIGHTGBM_SHAP_UPDATES.md`](update/LIGHTGBM_SHAP_UPDATES.md).)
+      as an offline benchmark next to an Isolation Forest scorer before
+      being switched to serving.)
 - **Phase 4 — Serving & analytical layer.**
   - [x] NestJS alert service: consumes `fraud.alerts`, persists idempotently
         to Postgres, broadcasts over WebSocket, serves REST history/detail,
@@ -65,8 +64,8 @@ implemented and tested; unchecked items are planned.
         other recent alerts), and disposition capture — verified in an
         actual browser against the live stack, including a real
         disposition round-trip and the metrics dashboard updating from it.
-  - [x] Delta Lake bronze layer (skipping silver, per the build plan's own
-        short-on-time cut) written continuously by the Spark job, plus a
+  - [x] Delta Lake bronze layer (skipping silver, a deliberate
+        scope cut) written continuously by the Spark job, plus a
         nightly batch job (a plain Python script standing in for Airflow)
         computing gold aggregates, PSI drift, data quality gates, and a
         report-only champion-vs-challenger retrain check — verified against
@@ -208,8 +207,8 @@ analytics/          Nightly batch job: bronze reads, gold, PSI, quality, retrain
                           alert funnel, from bronze Delta + a batch Kafka read
     retrain_check.py     challenger vs. champion, reusing pulseguard_detection's
                           already-tested training functions -- report only
-    nightly_job.py        the 5-step orchestrator (the build plan's
-                           "cron-triggered Python script" in place of Airflow)
+    nightly_job.py        the 5-step orchestrator (a
+                           cron-triggered Python script in place of Airflow)
   tests/              24 tests, all Spark-free (pure Python + pandas)
 infra/
   kafka/create_topics.sh   topic provisioning (partitions/retention)
@@ -424,8 +423,8 @@ label leakage, and the tell is a suspiciously perfect AUC.
 
 ## The streaming feature job, in more detail
 
-**Two independent stateful mechanisms, deliberately.** The build plan's
-watermarked-window code sample (`groupBy(customerId, window(...))`) is the
+**Two independent stateful mechanisms, deliberately.** The standard
+watermarked-window pattern (`groupBy(customerId, window(...))`) is the
 right tool for a straightforward rolling count/sum over a fixed window, but
 several features here don't fit that model at all — a 30-day trailing
 mean, "distinct devices in the last 7 days," or "is this merchant category
@@ -448,9 +447,9 @@ features. On a real fraud-detection critical path that's the right
 trade-off (a late mobile transaction should still update the customer's
 velocity state, not vanish).
 
-**Counting and routing late events, honestly scoped.** The build plan asks
-specifically for this: "count the drops and expose the number... route
-dropped events to a side output rather than silently discarding them."
+**Counting and routing late events, honestly scoped.** The goal here is
+to count late events, expose the number, and route them to a side output
+rather than silently discarding them.
 Since nothing is actually dropped on the feature path, and Spark's
 internal watermark value isn't queryable from user code to instrument the
 one query (the window demo) that does drop rows, `write_late_events`
@@ -496,7 +495,7 @@ entirely.
 
 **Trailing mean/std is an EMA, not an exact 30-day window** — an O(1)-state
 approximation rather than maintaining a 30-day ring buffer per customer.
-Worth saying out loud in an interview: it trades a little statistical
+It trades a little statistical
 precision for constant memory per customer regardless of transaction
 volume.
 
@@ -529,7 +528,7 @@ walks the tree through a whitelist of node types (boolean/comparison/
 arithmetic operators, variable lookups). There is no attribute access, no
 subscripting, no function calls — so a malicious or malformed rule string
 has no code-execution surface at all, regardless of what it contains. The 6
-rules in `rules.json` are adapted from the build plan's examples to the
+rules in `rules.json` are adapted from reference examples to the
 feature names this pipeline actually computes (e.g. `CARD_TESTING` checks
 `maxTxnsInAny60SecWindowToday` rather than a `txnCount1Min`/`distinctMerchants1Min`
 combination, since a single bounded event-history buffer already gives an
@@ -634,7 +633,7 @@ alone:
   explainable coverage that keeps working when the model is down or
   retraining.
 - **These are demo-scale numbers, not bank-scale ones.** The holdout spans
-  5.2 days at ~9,036 txns/day; the build plan's own worked example assumes
+  5.2 days at ~9,036 txns/day; a bank-scale worked example would assume
   4M txns/day. The *mechanism* (calibrate to review capacity, don't pick
   F1-optimal) is what transfers, not the literal alert-rate percentage.
 
@@ -784,8 +783,8 @@ breaks the cycle without reaching for `forwardRef()`.
    the queue before someone looked at it); it has to be measured from
    ingestion, not from whenever the underlying transaction happened.
 
-**What "drill-down" can and can't show yet.** The build plan's console
-mock-up includes "the customer's last 20 transactions for context" and a
+**What "drill-down" can and can't show yet.** The goal for the console's
+drill-down includes the customer's last 20 transactions for context and a
 map of recent geo activity. The geo map is covered (the alert payload was
 extended end-to-end -- Spark's `alert_scoring.py` through to the
 console's `GeoEmbed` component -- to carry amount, channel, merchant, city,
@@ -857,14 +856,13 @@ one shared connection.
 
 ## The nightly analytics job, in more detail
 
-**Bronze, not bronze+silver+gold.** The build plan's own short-on-time cut
-("Delta Lake layers — cut to bronze + gold, skip silver") is taken here
-literally: bronze is the Spark job's already-enriched output (raw fields +
-all 26 features + the isFraud/fraudPattern labels), partitioned by date --
+**Bronze, not bronze+silver+gold.** The scope here is deliberately cut to
+bronze + gold, skipping silver: bronze is the Spark job's already-enriched
+output (raw fields + all 26 features + the isFraud/fraudPattern labels), partitioned by date --
 what a strict medallion architecture would call silver, folded into
 bronze. Every gold computation, PSI check, and quality gate reads this one
 table. That's a real simplification, not a euphemism for "we didn't do
-it" -- it's the specific trade the plan explicitly sanctions.
+it" -- it's a specific, deliberate trade.
 
 **Gold is computed twice, on purpose.** Per-rule precision and the alert
 funnel already exist live in the NestJS alert service, computed from
@@ -941,8 +939,8 @@ data accumulated across this project's own testing (49,644 rows):
 
 Everything in this section is a number or an outcome actually observed
 running against the live Docker stack on this machine (`local[2]` --
-2 Spark cores, one broker, one Redis instance), not an estimate. Per the
-build plan's own admonition, and because it turned out to matter: none of
+2 Spark cores, one broker, one Redis instance), not an estimate. The goal is
+to report only measured numbers, and it turned out to matter: none of
 these numbers are what I would have guessed going in.
 
 ### The headline finding: three consumers cost roughly 15-40x, not 3x
@@ -968,7 +966,7 @@ GIL contention across `local[2]`'s two cores, and per-partition Redis I/O
 each get paid three times over, and at this deployment's resource scale
 that compounds rather than adding linearly. **What this means, honestly:**
 the "recompute vs. materialize once" tradeoff documented in `feature_job.py`
-is real and worth being able to explain in an interview, but at production
+is real and worth being able to explain, but at production
 scale the fix is exactly what the code comment says it isn't doing yet --
 materialize `feature_stream` to one intermediate topic or table once, and
 have Redis/bronze/alerts all read from *that*, or give the job more cores
@@ -1042,8 +1040,8 @@ For any target rate below 100 tx/s (where the true required gap exceeds
 of its own schedule. `--rate 20` measured **84-93 achieved tx/s** before
 the fix -- an inaccuracy that would have gone completely unnoticed if
 "looks roughly load-test-shaped" had been the bar instead of "achieved_tps
-printed at the end must match what was asked for," which the plan's own
-"never claim a number you haven't measured" instruction exists to force.
+printed at the end must match what was asked for," which the goal of
+never claiming a number that wasn't measured exists to force.
 Fixed by looping the sleep until `next_due` is actually reached; a
 regression test now runs a short real load test and asserts the achieved
 rate lands within tolerance of the target, at both a rate the old bug
@@ -1125,7 +1123,7 @@ regardless of whether the interruption was graceful or a `SIGKILL`; drill
 
 ### Exactly-once, precisely
 
-The build plan's own advice is to be able to state this mechanism exactly,
+The goal here is to state this mechanism exactly,
 not gesture at it -- and having now tested it against a real abrupt kill,
 here's what's actually true, including the parts that are "effectively
 exactly-once" rather than transactionally guaranteed:
@@ -1189,12 +1187,12 @@ idempotent sink (Redis), and one at-least-once sink whose duplicates are
 absorbed by an idempotent consumer (the alert service). That combination
 is what "exactly-once" means in most real streaming systems that claim
 it, and being able to say which piece provides which guarantee -- rather
-than "we use checkpoints so it's exactly-once" -- is the difference the
-build plan is pointing at.
+than "we use checkpoints so it's exactly-once" -- is the difference that
+matters.
 
 ## What breaks at 100x, and what I'd change
 
-The build plan asks this explicitly, and it deserves an answer grounded in
+The goal here is an answer grounded in
 what this session actually measured, not a generic "add more servers."
 Nothing here was tested at 100x (that would be ~2,000-3,000 tx/s on top of
 the ~20-300 tx/s range this project measured) -- these are the specific
@@ -1244,7 +1242,7 @@ rather than a fresh list of textbook scaling advice:
   one instance was never a bottleneck at this project's volume.
 - **The generator itself is a single Python process.** After fixing its
   rate-limiter bug (see above), it hits its target rate accurately, but
-  "accurately" tops out well short of the build plan's stated 3,000-5,000
+  "accurately" tops out well short of the 3,000-5,000
   tx/s achievable from a batched-produce `confluent-kafka` process --
   this project's generator uses `confluent-kafka` but produces one record
   at a time per the behavioural-pacing design, which is the right choice
@@ -1265,8 +1263,7 @@ rather than a fresh list of textbook scaling advice:
 
 ## Common mistakes
 
-These are the traps this project is deliberately built to avoid — see the
-build plan for the full list:
+These are the traps this project is deliberately built to avoid:
 
 - **Random data** instead of behavioural profiles.
 - **Label leakage** — `isFraud`/`fraudPattern` in the feature vector.
