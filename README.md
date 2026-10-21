@@ -858,7 +858,8 @@ one shared connection.
 
 **Bronze, not bronze+silver+gold.** The scope here is deliberately cut to
 bronze + gold, skipping silver: bronze is the Spark job's already-enriched
-output (raw fields + all 26 features + the isFraud/fraudPattern labels), partitioned by date --
+output (raw fields + all 26 features + the isFraud/fraudPattern labels),
+partitioned by date --
 what a strict medallion architecture would call silver, folded into
 bronze. Every gold computation, PSI check, and quality gate reads this one
 table. That's a real simplification, not a euphemism for "we didn't do
